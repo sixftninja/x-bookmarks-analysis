@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 import asyncio
 import os
@@ -46,6 +46,18 @@ async def _run_pipeline():
 
     categories_used = list({b["category"] for b in categorized})
     return {"status": "ok", "new_bookmarks": count, "categories_used": categories_used}
+
+
+@router.post("/sync/upload-db")
+async def upload_db(file: UploadFile = File(...), x_sync_secret: str = Header(default=None)):
+    expected = os.getenv("SYNC_SECRET", "")
+    if not x_sync_secret or x_sync_secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Sync-Secret header")
+    db_path = os.getenv("DATABASE_URL", "./bookmarks.db")
+    content = await file.read()
+    with open(db_path, "wb") as f:
+        f.write(content)
+    return {"status": "ok", "path": db_path, "size_bytes": len(content)}
 
 
 @router.post("/sync")
