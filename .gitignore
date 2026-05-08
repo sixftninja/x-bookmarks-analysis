@@ -1,0 +1,7 @@
+.env
+tokens.json
+bookmarks.db
+__pycache__/
+*.pyc
+.DS_Store
+venv/
