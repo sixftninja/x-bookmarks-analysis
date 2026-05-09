@@ -6,11 +6,13 @@ load_dotenv()
 
 from app.pipeline.fetch import fetch_bookmarks
 from app.pipeline.categorize import categorize_bookmarks
+from app.pipeline.llm import PROVIDER, MODEL
 from app.db import init_db, get_existing_tweet_ids, insert_bookmarks, get_categories, log_sync
 
-# claude-sonnet-4-20250514 pricing (USD per million tokens)
-INPUT_PRICE_PER_MTOK = 3.00
-OUTPUT_PRICE_PER_MTOK = 15.00
+_input_price = os.getenv("LLM_INPUT_PRICE_MTOK")
+_output_price = os.getenv("LLM_OUTPUT_PRICE_MTOK")
+INPUT_PRICE_PER_MTOK = float(_input_price) if _input_price else None
+OUTPUT_PRICE_PER_MTOK = float(_output_price) if _output_price else None
 
 
 def fmt_time(seconds):
@@ -58,22 +60,25 @@ def main():
         avg = elapsed / batch_num
         eta = (total - batch_num) * avg
 
-        cost = (
-            total_input_tokens / 1_000_000 * INPUT_PRICE_PER_MTOK
-            + total_output_tokens / 1_000_000 * OUTPUT_PRICE_PER_MTOK
-        )
-
         bar_width = 28
         filled = int(bar_width * batch_num / total)
         bar = "█" * filled + "░" * (bar_width - filled)
         pct = int(100 * batch_num / total)
+
+        cost_str = ""
+        if INPUT_PRICE_PER_MTOK is not None and OUTPUT_PRICE_PER_MTOK is not None:
+            cost = (
+                total_input_tokens / 1_000_000 * INPUT_PRICE_PER_MTOK
+                + total_output_tokens / 1_000_000 * OUTPUT_PRICE_PER_MTOK
+            )
+            cost_str = f"  cost ${cost:.4f}"
 
         print(
             f"\r  [{bar}] {pct:3d}%  batch {batch_num}/{total}"
             f"  elapsed {fmt_time(elapsed)}"
             f"  eta {fmt_time(eta)}"
             f"  tokens {total_input_tokens + total_output_tokens:,}"
-            f"  cost ${cost:.4f}",
+            f"{cost_str}",
             end="",
             flush=True,
         )
@@ -87,27 +92,33 @@ def main():
 
     total_elapsed = time.time() - overall_start
     total_tokens = total_input_tokens + total_output_tokens
-    total_cost = (
-        total_input_tokens / 1_000_000 * INPUT_PRICE_PER_MTOK
-        + total_output_tokens / 1_000_000 * OUTPUT_PRICE_PER_MTOK
-    )
+
+    if INPUT_PRICE_PER_MTOK is not None and OUTPUT_PRICE_PER_MTOK is not None:
+        total_cost = (
+            total_input_tokens / 1_000_000 * INPUT_PRICE_PER_MTOK
+            + total_output_tokens / 1_000_000 * OUTPUT_PRICE_PER_MTOK
+        )
+        cost_line = f"│ Estimated cost     ${total_cost:<14.4f} │"
+        pricing_note = f"  * Pricing: {PROVIDER}/{MODEL}\n    ${INPUT_PRICE_PER_MTOK}/MTok input · ${OUTPUT_PRICE_PER_MTOK}/MTok output"
+    else:
+        cost_line = "│ Estimated cost     (set LLM_*_PRICE) │"
+        pricing_note = f"  * Model: {PROVIDER}/{MODEL}\n    Set LLM_INPUT_PRICE_MTOK and LLM_OUTPUT_PRICE_MTOK to display cost."
 
     print(f"""
-┌─────────────────────────────────┐
-│            Summary              │
-├─────────────────────────────────┤
-│ Bookmarks stored   {count:<15} │
-│ Total time         {fmt_time(total_elapsed):<15} │
-│   Fetch            {fmt_time(fetch_elapsed):<15} │
-│   Categorize       {fmt_time(categorize_elapsed):<15} │
-├─────────────────────────────────┤
-│ Input tokens       {total_input_tokens:<15,} │
-│ Output tokens      {total_output_tokens:<15,} │
-│ Total tokens       {total_tokens:<15,} │
-│ Estimated cost     ${total_cost:<14.4f} │
-└─────────────────────────────────┘
-  * Pricing: claude-sonnet-4-20250514
-    $3/MTok input · $15/MTok output
+┌─────────────────────────────────────┐
+│              Summary                │
+├─────────────────────────────────────┤
+│ Bookmarks stored   {count:<19} │
+│ Total time         {fmt_time(total_elapsed):<19} │
+│   Fetch            {fmt_time(fetch_elapsed):<19} │
+│   Categorize       {fmt_time(categorize_elapsed):<19} │
+├─────────────────────────────────────┤
+│ Input tokens       {total_input_tokens:<19,} │
+│ Output tokens      {total_output_tokens:<19,} │
+│ Total tokens       {total_tokens:<19,} │
+{cost_line}
+└─────────────────────────────────────┘
+{pricing_note}
 """)
 
 

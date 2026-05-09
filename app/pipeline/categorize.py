@@ -1,11 +1,6 @@
 import json
-import os
-import anthropic
-from dotenv import load_dotenv
+from app.pipeline.llm import complete
 
-load_dotenv()
-
-MODEL = "claude-sonnet-4-20250514"
 BATCH_SIZE = 25
 
 BASE_SYSTEM_PROMPT = """You are analyzing a collection of bookmarked posts from X (Twitter). Your job is to:
@@ -23,8 +18,6 @@ INCREMENTAL_EXTRA = "\n- You have these existing categories: {categories}. Assig
 
 
 def categorize_bookmarks(bookmarks, existing_categories=None, on_batch_complete=None):
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
     system_prompt = BASE_SYSTEM_PROMPT
     if existing_categories:
         system_prompt += INCREMENTAL_EXTRA.format(categories=existing_categories)
@@ -35,7 +28,7 @@ def categorize_bookmarks(bookmarks, existing_categories=None, on_batch_complete=
     for idx, batch in enumerate(batches, 1):
         if not on_batch_complete:
             print(f"Categorizing batch {idx}/{len(batches)} ({len(batch)} posts)...")
-        batch_results, usage = _categorize_batch(client, system_prompt, batch)
+        batch_results, usage = _categorize_batch(system_prompt, batch)
         categorized.extend(batch_results)
         if on_batch_complete:
             on_batch_complete(idx, len(batches), usage)
@@ -55,12 +48,12 @@ def categorize_bookmarks(bookmarks, existing_categories=None, on_batch_complete=
             skipped += 1
 
     if skipped:
-        print(f"\nWARNING: {skipped} items skipped due to missing category/summary in Claude response")
+        print(f"\nWARNING: {skipped} items skipped due to missing category/summary in LLM response")
 
     return final
 
 
-def _categorize_batch(client, system_prompt, batch):
+def _categorize_batch(system_prompt, batch):
     posts = [
         {"tweet_id": b["tweet_id"], "content": b["full_content"], "author": b.get("author_username", "")}
         for b in batch
@@ -73,23 +66,14 @@ def _categorize_batch(client, system_prompt, batch):
         f"Posts:\n{json.dumps(posts, indent=2)}"
     )
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=8096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-    }
-    raw = response.content[0].text.strip()
-    results, final_usage = _parse_json_response(client, system_prompt, user_prompt, raw, usage=usage)
+    messages = [{"role": "user", "content": user_prompt}]
+    text, input_tokens, output_tokens = complete(system_prompt, messages)
+    usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    results, final_usage = _parse_json_response(system_prompt, messages, text.strip(), usage=usage)
     return results, final_usage
 
 
-def _parse_json_response(client, system_prompt, user_prompt, raw, usage=None, retry=False):
+def _parse_json_response(system_prompt, messages, raw, usage=None, retry=False):
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, list):
@@ -101,22 +85,13 @@ def _parse_json_response(client, system_prompt, user_prompt, raw, usage=None, re
             return [], usage or {}
 
         print("JSON parse failed, retrying with fix-up prompt...")
-        fix_response = client.messages.create(
-            model=MODEL,
-            max_tokens=8096,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_prompt},
-                {"role": "assistant", "content": raw},
-                {
-                    "role": "user",
-                    "content": "The response above is not valid JSON. Please return ONLY the valid JSON array with no other text.",
-                },
-            ],
-        )
+        fix_messages = messages + [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": "The response above is not valid JSON. Please return ONLY the valid JSON array with no other text."},
+        ]
+        fixed_text, fix_input, fix_output = complete(system_prompt, fix_messages)
         retry_usage = {
-            "input_tokens": (usage or {}).get("input_tokens", 0) + fix_response.usage.input_tokens,
-            "output_tokens": (usage or {}).get("output_tokens", 0) + fix_response.usage.output_tokens,
+            "input_tokens": (usage or {}).get("input_tokens", 0) + fix_input,
+            "output_tokens": (usage or {}).get("output_tokens", 0) + fix_output,
         }
-        fixed = fix_response.content[0].text.strip()
-        return _parse_json_response(client, system_prompt, user_prompt, fixed, usage=retry_usage, retry=True)
+        return _parse_json_response(system_prompt, messages, fixed_text.strip(), usage=retry_usage, retry=True)

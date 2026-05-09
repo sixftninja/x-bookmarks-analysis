@@ -1,14 +1,14 @@
 # X Bookmarks Analysis
 
-I built this to automatically fetch, categorize, and search my X bookmarks using AI. Every bookmark gets a category and a ~128 word summary written by Claude. I can search, filter, and manage everything conversationally from any device.
+I built this to automatically fetch, categorize, and search my X bookmarks using AI. Every bookmark gets a category and a ~128 word summary written by LLM of your choice. I can search, filter, and manage everything conversationally from any device.
 
 ---
 
 ## What You Need
 
 - Python 3.11+
-- [X Developer account](https://developer.x.com) (free)
-- [Anthropic API key](https://console.anthropic.com)
+- [X Developer account](https://developer.x.com) with API access — requires a paid Basic tier or higher ([X API pricing](https://developer.x.com/en/products/twitter-api), [subscription plans](https://developer.twitter.com/en/portal/products))
+- An LLM API key — Anthropic, OpenAI, Google, xAI, or Meta (defaults to Claude)
 
 ---
 
@@ -18,7 +18,7 @@ I built this to automatically fetch, categorize, and search my X bookmarks using
 
 1. Go to [developer.x.com](https://developer.x.com) → sign in → **Projects & Apps** → **+ New Project**
 2. Give it a name, pick any use case, and create an app inside it
-3. You'll see a Keys page with Consumer Key/Secret — **ignore these, they're the wrong credential type**
+3. You'll see a Keys page with Consumer Key/Secret — these are **OAuth 1.0a** credentials and won't work here. This app uses **OAuth 2.0 PKCE**, which needs a Client ID and Client Secret instead.
 4. Click the app name → **User Authentication Settings** → **Set up**
 5. Fill in:
    - **Type of App**: `Web App, Automated App or Bot`
@@ -40,12 +40,33 @@ cp .env.example .env
 Edit `.env`:
 
 ```
-X_CLIENT_ID=         # from step 1
-X_CLIENT_SECRET=     # from step 1
-ANTHROPIC_API_KEY=   # from console.anthropic.com
-SYNC_SECRET=         # run: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+X_CLIENT_ID=              # from step 1
+X_CLIENT_SECRET=          # from step 1
+ANTHROPIC_API_KEY=        # from console.anthropic.com (or swap in another provider below)
+SYNC_SECRET=              # run: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 DATABASE_URL=./bookmarks.db
+
+# LLM config — defaults to Claude, change to use a different provider
+LLM_PROVIDER=anthropic    # anthropic | openai | google | xai | meta
+LLM_MODEL=claude-sonnet-4-5  # pick any model from your chosen provider
+
+# Optional: fill these in to display a cost estimate in sync output
+# LLM_INPUT_PRICE_MTOK=3.00
+# LLM_OUTPUT_PRICE_MTOK=15.00
+(above values are for a specific Anthropic model, use your own)
 ```
+
+Provider options and their required API key variable:
+
+| Provider | `LLM_PROVIDER` | API key variable | Get key from |
+|----------|----------------|-----------------|--------------|
+| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` | console.anthropic.com |
+| OpenAI (GPT) | `openai` | `OPENAI_API_KEY` | platform.openai.com |
+| Google (Gemini) | `google` | `GOOGLE_API_KEY` | aistudio.google.com |
+| xAI (Grok) | `xai` | `XAI_API_KEY` | console.x.ai |
+| Meta (Llama) | `meta` | `META_API_KEY` | llama.com |
+
+Set `LLM_MODEL` to any model name your chosen provider supports (e.g. `gpt-4o`, `gemini-2.0-flash`, `grok-3`, `llama3.1-70b-instruct`). The pricing vars are optional — if omitted, cost won't be shown in sync output.
 
 ### 3. Authorize with X (one-time)
 
@@ -61,9 +82,9 @@ Opens your browser. Approve the app. Tokens are saved locally and refresh automa
 python scripts/sync.py
 ```
 
-Fetches all your bookmarks from X, categorizes and summarizes them via Claude. Shows a live progress bar with time elapsed, ETA, and cost.
+Fetches all your bookmarks from X, categorizes and summarizes them via your LLM. Shows a live progress bar with time elapsed, ETA, and cost.
 
-**Cost:** roughly $1–2 for 500 bookmarks (`claude-sonnet-4`, $3/MTok input · $15/MTok output). Re-running only processes new bookmarks — incremental syncs are cheap.
+**Cost:** roughly $1–2 for 500 bookmarks with `claude-sonnet-4` ($3/MTok input · $15/MTok output). Re-running only processes new bookmarks — incremental syncs are cheap.
 
 Run this script any time you want to pull in new bookmarks.
 
