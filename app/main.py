@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.routes import query, sync
 from app.db import init_db
+from app.mcp_server import mcp
 import os
 
 app = FastAPI(title="X Bookmarks Analysis API")
@@ -14,3 +15,4 @@ async def startup():
 
 app.include_router(query.router)
 app.include_router(sync.router)
+app.mount("/mcp", mcp.sse_app())
