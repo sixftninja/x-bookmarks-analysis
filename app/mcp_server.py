@@ -88,3 +88,88 @@ def get_sync_status() -> dict:
         "status": row[2] if row else None,
         "total_bookmarks": total,
     }
+
+
+@mcp.tool()
+def rename_category(old_name: str, new_name: str) -> dict:
+    """Rename a category across all bookmarks that have it."""
+    with sqlite3.connect(_db()) as conn:
+        cursor = conn.execute(
+            "UPDATE bookmarks SET category = ? WHERE LOWER(category) = LOWER(?)",
+            (new_name, old_name),
+        )
+        conn.commit()
+    return {"updated": cursor.rowcount, "old_name": old_name, "new_name": new_name}
+
+
+@mcp.tool()
+def move_bookmarks(tweet_ids: list[str], new_category: str) -> dict:
+    """Move one or more bookmarks to a category. The category is created if it doesn't exist yet."""
+    with sqlite3.connect(_db()) as conn:
+        cursor = conn.executemany(
+            "UPDATE bookmarks SET category = ? WHERE tweet_id = ?",
+            [(new_category, tid) for tid in tweet_ids],
+        )
+        conn.commit()
+    return {"moved": cursor.rowcount, "new_category": new_category}
+
+
+@mcp.tool()
+def merge_categories(source: str, target: str) -> dict:
+    """Move all bookmarks from source category into target category. Source category is removed."""
+    with sqlite3.connect(_db()) as conn:
+        cursor = conn.execute(
+            "UPDATE bookmarks SET category = ? WHERE LOWER(category) = LOWER(?)",
+            (target, source),
+        )
+        conn.commit()
+    return {"moved": cursor.rowcount, "source": source, "target": target}
+
+
+@mcp.tool()
+def delete_bookmarks(tweet_ids: list[str]) -> dict:
+    """Permanently delete one or more bookmarks by tweet_id."""
+    with sqlite3.connect(_db()) as conn:
+        cursor = conn.executemany(
+            "DELETE FROM bookmarks WHERE tweet_id = ?",
+            [(tid,) for tid in tweet_ids],
+        )
+        conn.commit()
+    return {"deleted": cursor.rowcount}
+
+
+@mcp.tool()
+def delete_category(category: str) -> dict:
+    """Permanently delete all bookmarks in a category."""
+    with sqlite3.connect(_db()) as conn:
+        cursor = conn.execute(
+            "DELETE FROM bookmarks WHERE LOWER(category) = LOWER(?)",
+            (category,),
+        )
+        conn.commit()
+    return {"deleted": cursor.rowcount, "category": category}
+
+
+@mcp.tool()
+def edit_bookmark(tweet_id: str, category: str = None, summary: str = None) -> dict:
+    """Edit the category and/or summary of a specific bookmark."""
+    if not category and not summary:
+        return {"error": "Provide at least one of: category, summary"}
+    with sqlite3.connect(_db()) as conn:
+        if category and summary:
+            conn.execute(
+                "UPDATE bookmarks SET category = ?, summary = ? WHERE tweet_id = ?",
+                (category, summary, tweet_id),
+            )
+        elif category:
+            conn.execute(
+                "UPDATE bookmarks SET category = ? WHERE tweet_id = ?",
+                (category, tweet_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE bookmarks SET summary = ? WHERE tweet_id = ?",
+                (summary, tweet_id),
+            )
+        conn.commit()
+    return {"updated": tweet_id, "category": category, "summary": summary}
