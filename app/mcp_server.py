@@ -151,6 +151,36 @@ def delete_category(category: str) -> dict:
 
 
 @mcp.tool()
+def trigger_sync() -> dict:
+    """Fetch new bookmarks from X and categorize them. Returns how many were added."""
+    from app.pipeline.auth import get_valid_access_token
+    from app.pipeline.fetch import fetch_bookmarks
+    from app.pipeline.categorize import categorize_bookmarks
+    from app.db import get_existing_tweet_ids, get_categories, insert_bookmarks, log_sync
+
+    db_path = _db()
+    try:
+        get_valid_access_token(db_path)
+        existing_ids = get_existing_tweet_ids(db_path)
+        new_tweets = fetch_bookmarks(existing_tweet_ids=existing_ids, db_path=db_path)
+
+        if not new_tweets:
+            log_sync(0, "success", None, db_path)
+            return {"status": "ok", "new_bookmarks": 0, "message": "No new bookmarks found"}
+
+        existing_cats = get_categories(db_path)
+        categorized = categorize_bookmarks(new_tweets, existing_categories=existing_cats)
+        count = insert_bookmarks(categorized, db_path)
+        log_sync(count, "success", None, db_path)
+
+        categories_used = list({b["category"] for b in categorized})
+        return {"status": "ok", "new_bookmarks": count, "categories_used": categories_used}
+    except Exception as e:
+        log_sync(0, "error", str(e), db_path)
+        return {"status": "error", "detail": str(e)}
+
+
+@mcp.tool()
 def edit_bookmark(tweet_id: str, category: str = None, summary: str = None) -> dict:
     """Edit the category and/or summary of a specific bookmark."""
     if not category and not summary:

@@ -166,7 +166,7 @@ You can then ask Claude things like:
 - *"Merge 'Link Shares' and 'Link-Only Posts' into 'Bare Links'"*
 - *"Move these bookmarks to a new category called 'AI Infrastructure'"*
 
-**Available tools:** `get_bookmark_stats`, `get_categories`, `get_bookmarks_by_category`, `search_bookmarks`, `get_recent_bookmarks`, `get_sync_status`, `rename_category`, `move_bookmarks`, `merge_categories`, `delete_bookmarks`, `delete_category`, `edit_bookmark`
+**Available tools:** `get_bookmark_stats`, `get_categories`, `get_bookmarks_by_category`, `search_bookmarks`, `get_recent_bookmarks`, `get_sync_status`, `trigger_sync`, `rename_category`, `move_bookmarks`, `merge_categories`, `delete_bookmarks`, `delete_category`, `edit_bookmark`
 
 ---
 
