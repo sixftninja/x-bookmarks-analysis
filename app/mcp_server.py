@@ -181,25 +181,26 @@ def trigger_sync() -> dict:
 
 
 @mcp.tool()
-def edit_bookmark(tweet_id: str, category: str = None, summary: str = None) -> dict:
-    """Edit the category and/or summary of a specific bookmark."""
-    if not category and not summary:
-        return {"error": "Provide at least one of: category, summary"}
+def edit_bookmark(tweet_id: str, category: str = None, summary: str = None, full_content: str = None) -> dict:
+    """Edit the category, summary, and/or full_content of a specific bookmark."""
+    if not category and not summary and not full_content:
+        return {"error": "Provide at least one of: category, summary, full_content"}
+    fields = []
+    values = []
+    if category:
+        fields.append("category = ?")
+        values.append(category)
+    if summary:
+        fields.append("summary = ?")
+        values.append(summary)
+    if full_content:
+        fields.append("full_content = ?")
+        values.append(full_content)
+    values.append(tweet_id)
     with sqlite3.connect(_db()) as conn:
-        if category and summary:
-            conn.execute(
-                "UPDATE bookmarks SET category = ?, summary = ? WHERE tweet_id = ?",
-                (category, summary, tweet_id),
-            )
-        elif category:
-            conn.execute(
-                "UPDATE bookmarks SET category = ? WHERE tweet_id = ?",
-                (category, tweet_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE bookmarks SET summary = ? WHERE tweet_id = ?",
-                (summary, tweet_id),
-            )
+        conn.execute(
+            f"UPDATE bookmarks SET {', '.join(fields)} WHERE tweet_id = ?",
+            values,
+        )
         conn.commit()
-    return {"updated": tweet_id, "category": category, "summary": summary}
+    return {"updated": tweet_id, "category": category, "summary": summary, "full_content": full_content}
