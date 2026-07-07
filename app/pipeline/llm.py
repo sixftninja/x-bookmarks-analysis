@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
-MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.getenv("LLM_MODEL", "claude-sonnet-5")
 MAX_TOKENS = 8096
 
 

@@ -48,7 +48,7 @@ DATABASE_URL=./bookmarks.db
 
 # LLM config — defaults to Claude, change to use a different provider
 LLM_PROVIDER=anthropic    # anthropic | openai | google | xai | meta
-LLM_MODEL=claude-sonnet-4-5  # pick any model from your chosen provider
+LLM_MODEL=claude-sonnet-5  # pick any model from your chosen provider
 
 # Optional: fill these in to display a cost estimate in sync output
 # LLM_INPUT_PRICE_MTOK=3.00
@@ -84,7 +84,7 @@ python scripts/sync.py
 
 Fetches all your bookmarks from X, categorizes and summarizes them via your LLM. Shows a live progress bar with time elapsed, ETA, and cost.
 
-**Cost:** roughly $1–2 for 500 bookmarks with `claude-sonnet-4` ($3/MTok input · $15/MTok output). Re-running only processes new bookmarks — incremental syncs are cheap.
+**Cost:** roughly $1–2 for 500 bookmarks with `claude-sonnet-5` ($3/MTok input · $15/MTok output; $2/$10 introductory pricing through 2026-08-31). Re-running only processes new bookmarks — incremental syncs are cheap.
 
 Run this script any time you want to pull in new bookmarks.
 
