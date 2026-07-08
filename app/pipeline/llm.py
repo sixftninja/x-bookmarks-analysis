@@ -39,8 +39,9 @@ def _anthropic(system, messages):
         system=system,
         messages=messages,
     )
+    text = next(block.text for block in response.content if block.type == "text")
     return (
-        response.content[0].text,
+        text,
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
