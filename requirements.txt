@@ -5,3 +5,4 @@ anthropic==0.28.0
 python-dotenv==1.0.1
 python-multipart==0.0.9
 mcp>=1.2.0
+trafilatura>=1.12.0

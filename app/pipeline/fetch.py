@@ -1,13 +1,17 @@
 import json
 import os
+import re
 import time
 import httpx
+import trafilatura
 from dotenv import load_dotenv
 from app.pipeline.auth import get_valid_access_token
 
 load_dotenv()
 
 BASE_URL = "https://api.x.com/2"
+
+_SELF_STATUS_RE = re.compile(r"/status/\d+/?$")
 
 
 def _headers(token):
@@ -33,6 +37,39 @@ def _extract_media_urls(entities):
         )
     ]
     return json.dumps(media) if media else None
+
+
+def _find_article_source_url(tweet):
+    """Detect X Article 'cover' posts: text is nothing but a link to an
+    /i/article/ page or a self-referencing status URL. The v2 bookmarks
+    endpoint only returns teaser text for these, so the real body has to
+    be scraped from the article page itself."""
+    entities = tweet.get("entities") or {}
+    text = (tweet.get("text") or "").strip()
+    if not text:
+        return None
+    for u in entities.get("urls", []):
+        expanded = u.get("expanded_url") or ""
+        short = u.get("url") or ""
+        if not expanded or not short:
+            continue
+        is_article_link = "/i/article/" in expanded
+        is_self_link = bool(_SELF_STATUS_RE.search(expanded))
+        if (is_article_link or is_self_link) and text == short:
+            return expanded
+    return None
+
+
+def _fetch_article_text(url):
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return None
+        text = trafilatura.extract(downloaded)
+        return text.strip() if text else None
+    except Exception as e:
+        print(f"Article scrape failed for {url}: {e}")
+        return None
 
 
 def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
@@ -82,12 +119,20 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
                 all_known = False
             author = users_map.get(tweet.get("author_id", ""), {})
             author_username = author.get("username")
+
+            full_content = tweet.get("text", "")
+            article_url = _find_article_source_url(tweet)
+            if article_url:
+                scraped = _fetch_article_text(article_url)
+                if scraped:
+                    full_content = scraped
+
             page_results.append(
                 {
                     "tweet_id": tweet_id,
                     "author_username": author_username,
                     "author_name": author.get("name"),
-                    "full_content": tweet.get("text", ""),
+                    "full_content": full_content,
                     "media_urls": _extract_media_urls(tweet.get("entities")),
                     "tweet_url": (
                         f"https://x.com/{author_username}/status/{tweet_id}"
