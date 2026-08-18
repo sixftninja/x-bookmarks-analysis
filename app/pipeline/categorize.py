@@ -1,4 +1,5 @@
 import json
+import re
 from app.pipeline.llm import complete
 
 BATCH_SIZE = 25
@@ -11,6 +12,7 @@ BASE_SYSTEM_PROMPT = """You are analyzing a collection of bookmarked posts from 
 Rules:
 - Create 5-15 categories maximum, depending on content diversity
 - Category names must be specific (e.g. "AI Safety Research", "Startup GTM Strategy") not generic (e.g. "Interesting", "Tech", "Other")
+- Group posts by their broad underlying subject/topic, not by surface wording. Two posts can use completely different vocabulary and examples and still belong in the same category if they're fundamentally about the same thing (e.g. a post about LangGraph agent loops and a post about Claude Code subagent orchestration are both "AI Agent Harness Design", even though they don't share terminology)
 - Summaries must capture what the post actually argues or reveals, not just describe it
 - Return ONLY a valid JSON array. No markdown, no explanation, no code fences."""
 
@@ -73,9 +75,12 @@ def _categorize_batch(system_prompt, batch):
     return results, final_usage
 
 
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+
 def _parse_json_response(system_prompt, messages, raw, usage=None, retry=False):
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(_CODE_FENCE_RE.sub("", raw).strip())
         if not isinstance(parsed, list):
             raise json.JSONDecodeError("Expected a JSON array", raw, 0)
         return parsed, usage or {}

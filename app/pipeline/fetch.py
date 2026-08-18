@@ -1,9 +1,11 @@
+import base64
 import json
 import os
 import re
 import time
 import httpx
 import trafilatura
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from app.pipeline.auth import get_valid_access_token
 
@@ -11,7 +13,32 @@ load_dotenv()
 
 BASE_URL = "https://api.x.com/2"
 
-_SELF_STATUS_RE = re.compile(r"/status/\d+/?$")
+BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+ARTICLE_HREF_RE = re.compile(r"^/i/article/\d+")
+BARE_LINK_RE = re.compile(r"^https://t\.co/\w+$")
+HANDLE_HREF_RE = re.compile(r"^/([A-Za-z0-9_]{1,15})$")
+ARTICLE_LEN_THRESHOLD = 1500  # chars — signals a tweet's own status page already inlines a full article body
+
+# Chrome around a tweet block's own text (author name/handle header, date,
+# "Article" label, trailing engagement-stat numbers) — stripped only when we
+# have no clean API text to use instead (i.e. for quoted tweets, and for a
+# primary tweet whose own status page inlined a full article body).
+_MONTH_ABBR_RE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-zA-Z]*\.? \d{1,2}$")
+_STAT_LINE_RE = re.compile(r"^[\d.,]+[KM]?$")
+_TIME_LINE_RE = re.compile(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*[·\-]")
+
+OPENAI_VISION_MODEL = "gpt-4o"
+ANTHROPIC_VISION_MODEL = "claude-sonnet-5"
+
+VISION_INSTRUCTION = (
+    "You are continuing a piece of writing at the exact point an image appeared. "
+    "Write 1-3 sentences describing what the image shows, but phrased as if the "
+    "original author is directly describing/narrating it themselves as part of "
+    "their own prose — never use meta-language like 'the image shows', 'this "
+    "picture depicts', 'in this screenshot', etc. Just write the content directly, "
+    "in a plain, matter-of-fact register consistent with tech/startup writing. "
+    "Return only the text to splice in, nothing else."
+)
 
 
 def _headers(token):
@@ -39,28 +66,84 @@ def _extract_media_urls(entities):
     return json.dumps(media) if media else None
 
 
-def _find_article_source_url(tweet):
-    """Detect X Article 'cover' posts: text is nothing but a link to an
-    /i/article/ page or a self-referencing status URL. The v2 bookmarks
-    endpoint only returns teaser text for these, so the real body has to
-    be scraped from the article page itself."""
-    entities = tweet.get("entities") or {}
-    text = (tweet.get("text") or "").strip()
-    if not text:
-        return None
-    for u in entities.get("urls", []):
-        expanded = u.get("expanded_url") or ""
-        short = u.get("url") or ""
-        if not expanded or not short:
-            continue
-        is_article_link = "/i/article/" in expanded
-        is_self_link = bool(_SELF_STATUS_RE.search(expanded))
-        if (is_article_link or is_self_link) and text == short:
-            return expanded
+# ---------------------------------------------------------------------------
+# Plain-HTTP status-page parsing (primary path — validated against real
+# tweets: reaches x.com fine without OAuth, article bodies come inlined into
+# a tweet's own status page, and quote-tweets are a nested
+# <article data-tweet-id> element inside the primary tweet's own block).
+# ---------------------------------------------------------------------------
+
+def _own_text(block, exclude_id=None):
+    """get_text() of a block with any nested quote-tweet subtree stripped out."""
+    copy = BeautifulSoup(str(block), "lxml")
+    if exclude_id:
+        nested = copy.find("article", attrs={"data-tweet-id": exclude_id})
+        if nested:
+            nested.decompose()
+    return copy.get_text(separator="\n", strip=True)
+
+
+def _find_article_href(block, exclude_id=None):
+    copy = BeautifulSoup(str(block), "lxml")
+    if exclude_id:
+        nested = copy.find("article", attrs={"data-tweet-id": exclude_id})
+        if nested:
+            nested.decompose()
+    a = copy.find("a", href=ARTICLE_HREF_RE)
+    return a.get("href") if a else None
+
+
+def _find_content_images(block, exclude_id=None):
+    copy = BeautifulSoup(str(block), "lxml")
+    if exclude_id:
+        nested = copy.find("article", attrs={"data-tweet-id": exclude_id})
+        if nested:
+            nested.decompose()
+    urls = []
+    for img in copy.find_all("img"):
+        src = img.get("src", "")
+        if "pbs.twimg.com/media/" in src and src not in urls:
+            urls.append(src)
+    return urls
+
+
+def _extract_handle(block):
+    for a in block.find_all("a", href=True):
+        m = HANDLE_HREF_RE.match(a["href"])
+        if m:
+            return m.group(1)
     return None
 
 
-def _fetch_article_text(url):
+def _strip_chrome(text, handle):
+    """Removes the author name/handle/date header and trailing engagement-stat
+    footer from a block's raw get_text() output. Only used when there's no
+    clean API text to prefer instead."""
+    lines = text.split("\n")
+
+    if handle:
+        marker = f"@{handle}"
+        if marker in lines[:4]:
+            lines = lines[lines.index(marker) + 1:]
+            while lines and (
+                lines[0].strip() in ("Article", "")
+                or _MONTH_ABBR_RE.match(lines[0].strip())
+            ):
+                lines.pop(0)
+
+    while lines and (
+        _STAT_LINE_RE.match(lines[-1].strip())
+        or lines[-1].strip() in ("Views", "")
+        or _TIME_LINE_RE.match(lines[-1].strip())
+    ):
+        lines.pop()
+
+    return "\n".join(lines).strip()
+
+
+def _fetch_article_text_trafilatura(url):
+    """Fallback only — used when the BeautifulSoup article-page parse below
+    comes back empty (page structure changed, etc)."""
     try:
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
@@ -68,8 +151,261 @@ def _fetch_article_text(url):
         text = trafilatura.extract(downloaded)
         return text.strip() if text else None
     except Exception as e:
-        print(f"Article scrape failed for {url}: {e}")
+        print(f"trafilatura fallback failed for {url}: {e}")
         return None
+
+
+def _scrape_article_page(article_url):
+    """Dedicated x.com/i/article/<id> pages use a different template than
+    status pages: <article class="mx-auto..."> > <h1> + <div class="x-article-body">.
+    Returns (text, image_urls)."""
+    try:
+        resp = httpx.get(article_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        body = soup.find("div", class_="x-article-body")
+        if body:
+            title_el = soup.find("h1")
+            title = title_el.get_text(strip=True) if title_el else ""
+            text = body.get_text(separator="\n", strip=True)
+            full_text = f"{title}\n\n{text}".strip() if title else text
+            images = [
+                img.get("src")
+                for img in body.find_all("img")
+                if "pbs.twimg.com/media/" in (img.get("src") or "")
+            ]
+            if full_text:
+                return full_text, images
+    except Exception as e:
+        print(f"Article page parse failed for {article_url}: {e}")
+
+    text = _fetch_article_text_trafilatura(article_url)
+    return (text, []) if text else (None, [])
+
+
+def _process_block(block, exclude_id, clean_text_fallback=None):
+    """Returns {"text", "scraped", "image_urls"} for one tweet block (primary
+    or quoted). Follows an /i/article/ link if present; otherwise, for the
+    common case (no article, no quote, no images) prefers clean_text_fallback
+    — the original API tweet text — over the HTML block's own get_text(),
+    which carries name/handle/stat chrome that needs stripping. Only the
+    primary tweet has API text available; quoted tweets always go through
+    chrome-stripping."""
+    raw_text = _own_text(block, exclude_id=exclude_id)
+    article_href = _find_article_href(block, exclude_id=exclude_id)
+
+    if article_href:
+        article_url = f"https://x.com{article_href}"
+        scraped_text, scraped_images = _scrape_article_page(article_url)
+        if scraped_text:
+            return {"text": scraped_text, "scraped": True, "image_urls": scraped_images}
+        print(f"Article scrape failed for {article_url}, falling back to teaser text")
+
+    image_urls = _find_content_images(block, exclude_id=exclude_id)
+
+    if len(raw_text) > ARTICLE_LEN_THRESHOLD:
+        # X inlined a full article body directly into this block's own status
+        # page — no separate fetch needed, but it's scraped content, not a
+        # plain tweet, so still clean the chrome off it.
+        handle = _extract_handle(block)
+        return {"text": _strip_chrome(raw_text, handle), "scraped": True, "image_urls": image_urls}
+
+    if clean_text_fallback:
+        return {"text": clean_text_fallback, "scraped": False, "image_urls": image_urls}
+
+    handle = _extract_handle(block)
+    return {"text": _strip_chrome(raw_text, handle), "scraped": False, "image_urls": image_urls}
+
+
+# ---------------------------------------------------------------------------
+# Image description (OpenAI first, Anthropic fallback). Bytes only ever live
+# in memory — never written to disk or the DB.
+# ---------------------------------------------------------------------------
+
+def _guess_mime(url, content_type):
+    if content_type and content_type.startswith("image/"):
+        return content_type.split(";")[0].strip()
+    lower = url.lower()
+    if ".png" in lower:
+        return "image/png"
+    if ".gif" in lower:
+        return "image/gif"
+    if ".webp" in lower:
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _download_image_bytes(url):
+    resp = httpx.get(url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
+    resp.raise_for_status()
+    return resp.content, _guess_mime(url, resp.headers.get("content-type"))
+
+
+def _describe_image_openai(image_bytes, mime):
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    b64 = base64.b64encode(image_bytes).decode()
+    resp = client.chat.completions.create(
+        model=OPENAI_VISION_MODEL,
+        max_tokens=500,
+        messages=[
+            {"role": "system", "content": VISION_INSTRUCTION},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image per the instructions."},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ],
+            },
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def _describe_image_anthropic(image_bytes, mime):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    b64 = base64.b64encode(image_bytes).decode()
+    resp = client.messages.create(
+        model=ANTHROPIC_VISION_MODEL,
+        max_tokens=500,
+        system=VISION_INSTRUCTION,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                    {"type": "text", "text": "Describe this image per the instructions."},
+                ],
+            }
+        ],
+    )
+    return next(b.text for b in resp.content if b.type == "text").strip()
+
+
+def _describe_image(url):
+    """Returns (description, error). description is None if both providers failed."""
+    try:
+        image_bytes, mime = _download_image_bytes(url)
+    except Exception as e:
+        return None, f"download failed: {type(e).__name__}: {e}"
+
+    openai_error = None
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            return _describe_image_openai(image_bytes, mime), None
+        except Exception as e:
+            openai_error = f"{type(e).__name__}: {e}"
+    else:
+        openai_error = "OPENAI_API_KEY not set"
+
+    if os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            return _describe_image_anthropic(image_bytes, mime), None
+        except Exception as e:
+            return None, f"openai failed ({openai_error}); anthropic failed ({type(e).__name__}: {e})"
+
+    return None, f"openai failed ({openai_error}); anthropic not configured (ANTHROPIC_API_KEY not set)"
+
+
+def _describe_and_append_images(image_urls):
+    """Returns (appended_text, image_processing_status). Descriptions are
+    always appended at the end of full_content — never spliced inline."""
+    image_urls = list(dict.fromkeys(image_urls))  # dedupe, preserve order
+    if not image_urls:
+        return "", "no_images_found"
+
+    descriptions = []
+    failures = 0
+    for url in image_urls:
+        description, error = _describe_image(url)
+        if description:
+            descriptions.append(description)
+        else:
+            failures += 1
+            print(f"Image description failed for {url}: {error}")
+
+    if not descriptions:
+        return "", "images_fetch_failed"
+
+    status = "images_partially_appended" if failures else "images_appended_successfully"
+    return "\n\n".join(descriptions), status
+
+
+# ---------------------------------------------------------------------------
+# Top-level enrichment: fetch a tweet's own status page and build the final
+# full_content / content_source / image_processing_status / quoted_tweet_id.
+# ---------------------------------------------------------------------------
+
+def _enrich_via_html(tweet_url, tweet_id, api_text):
+    """Returns None on hard failure (page unreachable or unexpected shape) —
+    caller falls back to the bare API tweet text."""
+    resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    primary_block = soup.find("article", attrs={"data-tweet-id": tweet_id})
+    if primary_block is None:
+        return None
+
+    quoted_block = primary_block.find("article", attrs={"data-tweet-id": True})
+    quoted_id = quoted_block.get("data-tweet-id") if quoted_block else None
+
+    primary = _process_block(primary_block, exclude_id=quoted_id, clean_text_fallback=api_text)
+    full_content = primary["text"]
+    scraped_any = primary["scraped"]
+    image_urls = list(primary["image_urls"])
+
+    if quoted_block is not None:
+        quoted = _process_block(quoted_block, exclude_id=None)
+        handle = _extract_handle(quoted_block)
+        quoted_label = f"@{handle}" if handle else "the quoted tweet"
+        full_content = f"{full_content}\n\n---\nQuoted {quoted_label}:\n{quoted['text']}"
+        scraped_any = scraped_any or quoted["scraped"]
+        image_urls.extend(quoted["image_urls"])
+
+    appended, image_status = _describe_and_append_images(image_urls)
+    if appended:
+        full_content = f"{full_content}\n\n{appended}"
+
+    return {
+        "full_content": full_content.strip(),
+        "content_source": "api_scraped_article" if scraped_any else "api_text",
+        "image_processing_status": image_status,
+        "quoted_tweet_id": quoted_id,
+    }
+
+
+def enrich_tweet_content(api_text, author_username, tweet_id):
+    """Public entry point used by fetch_bookmarks() and the one-time
+    migration script. Given the bare API tweet text plus enough to build the
+    tweet's own status URL, returns
+    (full_content, content_source, image_processing_status, quoted_tweet_id).
+    Falls back to the bare API text if the HTML page can't be fetched/parsed."""
+    api_text = api_text or ""
+
+    if author_username:
+        tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
+        try:
+            enriched = _enrich_via_html(tweet_url, tweet_id, api_text)
+        except Exception as e:
+            print(f"HTML enrichment failed for {tweet_url}: {e}")
+            enriched = None
+    else:
+        enriched = None
+
+    if enriched:
+        return (
+            enriched["full_content"],
+            enriched["content_source"],
+            enriched["image_processing_status"],
+            enriched["quoted_tweet_id"],
+        )
+
+    content_source = "api_teaser_only" if BARE_LINK_RE.match(api_text.strip()) else "api_text"
+    return api_text, content_source, "no_images_found", None
 
 
 def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
@@ -120,12 +456,9 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
             author = users_map.get(tweet.get("author_id", ""), {})
             author_username = author.get("username")
 
-            full_content = tweet.get("text", "")
-            article_url = _find_article_source_url(tweet)
-            if article_url:
-                scraped = _fetch_article_text(article_url)
-                if scraped:
-                    full_content = scraped
+            full_content, content_source, image_processing_status, quoted_tweet_id = enrich_tweet_content(
+                tweet.get("text", ""), author_username, tweet_id
+            )
 
             page_results.append(
                 {
@@ -133,6 +466,9 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
                     "author_username": author_username,
                     "author_name": author.get("name"),
                     "full_content": full_content,
+                    "content_source": content_source,
+                    "image_processing_status": image_processing_status,
+                    "quoted_tweet_id": quoted_tweet_id,
                     "media_urls": _extract_media_urls(tweet.get("entities")),
                     "tweet_url": (
                         f"https://x.com/{author_username}/status/{tweet_id}"

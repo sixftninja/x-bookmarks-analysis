@@ -18,9 +18,21 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     media_urls TEXT,
     tweet_url TEXT,
     bookmarked_at TEXT,
-    categorized_at TEXT DEFAULT (datetime('now'))
+    categorized_at TEXT DEFAULT (datetime('now')),
+    content_source TEXT,
+    image_processing_status TEXT,
+    quoted_tweet_id TEXT
 );
 """
+
+# Columns added after the original schema shipped. init_db() adds these to
+# already-existing tables via ALTER TABLE, since CREATE TABLE IF NOT EXISTS
+# is a no-op on a table that already exists.
+_ADDED_COLUMNS = [
+    ("content_source", "TEXT"),
+    ("image_processing_status", "TEXT"),
+    ("quoted_tweet_id", "TEXT"),
+]
 
 CREATE_SYNC_LOG = """
 CREATE TABLE IF NOT EXISTS sync_log (
@@ -49,11 +61,19 @@ CREATE_INDEXES = [
 ]
 
 
+def _migrate_bookmarks_columns(conn):
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(bookmarks)")}
+    for name, col_type in _ADDED_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE bookmarks ADD COLUMN {name} {col_type}")
+
+
 def init_db(db_path=DEFAULT_DB):
     with sqlite3.connect(db_path) as conn:
         conn.execute(CREATE_BOOKMARKS)
         conn.execute(CREATE_SYNC_LOG)
         conn.execute(CREATE_OAUTH_TOKENS)
+        _migrate_bookmarks_columns(conn)
         for idx in CREATE_INDEXES:
             conn.execute(idx)
         conn.commit()
@@ -65,13 +85,17 @@ def insert_bookmarks(bookmarks, db_path=DEFAULT_DB):
     sql = """
         INSERT OR IGNORE INTO bookmarks
             (tweet_id, author_username, author_name, category, summary,
-             full_content, media_urls, tweet_url, bookmarked_at)
+             full_content, media_urls, tweet_url, bookmarked_at,
+             content_source, image_processing_status, quoted_tweet_id)
         VALUES
             (:tweet_id, :author_username, :author_name, :category, :summary,
-             :full_content, :media_urls, :tweet_url, :bookmarked_at)
+             :full_content, :media_urls, :tweet_url, :bookmarked_at,
+             :content_source, :image_processing_status, :quoted_tweet_id)
     """
+    defaults = {"content_source": "api_text", "image_processing_status": "no_images_found", "quoted_tweet_id": None}
+    rows = [{**defaults, **b} for b in bookmarks]
     with sqlite3.connect(db_path) as conn:
-        cursor = conn.executemany(sql, bookmarks)
+        cursor = conn.executemany(sql, rows)
         conn.commit()
         return cursor.rowcount
 
