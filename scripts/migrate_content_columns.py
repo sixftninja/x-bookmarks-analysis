@@ -13,6 +13,13 @@ What it does, in order:
    - In "Link-Only Posts" but already has real content (was pasted in by
      hand) -> manual
    - Everything else -> api_text
+2b. Catches stray bare-link rows outside "Link-Only Posts": the
+    categorization AI scattered this same bug across many differently-named
+    categories over time (External Links, AI Development Tools, General
+    Links, ...), so category name alone isn't a reliable signal. Any row
+    anywhere whose full_content is still just a bare t.co link gets
+    reclassified to api_teaser_only regardless of its current category or
+    content_source, so step 3 picks it up too.
 3. Retries every api_teaser_only row through the new HTML-scrape pipeline
    (app.pipeline.fetch.enrich_tweet_content). Success -> full_content,
    content_source, image_processing_status, quoted_tweet_id all get updated.
@@ -27,8 +34,9 @@ What it does, in order:
    where it left off instead of silently skipping them.
 
 Safe to re-run: classification only touches rows where content_source IS
-NULL, and the backfill/recategorize steps only touch rows still in the
-states they target.
+NULL, the stray-bare-link reclassification only touches rows that are
+still literally a bare link, and the backfill/recategorize steps only
+touch rows still in the states they target.
 
 Usage:
     python scripts/migrate_content_columns.py
@@ -94,6 +102,36 @@ def _classify_existing_rows(db_path):
         counts[content_source] = counts.get(content_source, 0) + 1
     print(f"Classified {len(updates)} existing row(s): {counts}")
     return counts
+
+
+def _reclassify_stray_bare_links(db_path):
+    """Category name alone isn't a reliable signal for "this row is still
+    broken" — the categorization AI scattered the bare-link bug across many
+    differently-named categories, not just "Link-Only Posts". Find any row,
+    anywhere, whose full_content is still just a bare t.co link and flag it
+    api_teaser_only so the backfill step below picks it up too."""
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT tweet_id, full_content, content_source FROM bookmarks"
+        ).fetchall()
+
+        stray_ids = [
+            tweet_id
+            for tweet_id, full_content, content_source in rows
+            if content_source != "api_teaser_only"
+            and full_content
+            and BARE_LINK_RE.match(full_content.strip())
+        ]
+
+        if stray_ids:
+            conn.executemany(
+                "UPDATE bookmarks SET content_source = 'api_teaser_only' WHERE tweet_id = ?",
+                [(tid,) for tid in stray_ids],
+            )
+            conn.commit()
+
+    print(f"Reclassified {len(stray_ids)} stray bare-link row(s) outside 'Link-Only Posts' as api_teaser_only.")
+    return len(stray_ids)
 
 
 def _backfill_teaser_only_rows(db_path):
@@ -191,6 +229,7 @@ def main():
     init_db(db_path)
 
     _classify_existing_rows(db_path)
+    _reclassify_stray_bare_links(db_path)
     _backfill_teaser_only_rows(db_path)
     _recategorize_manual_rows(db_path)
 
