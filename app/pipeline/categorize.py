@@ -81,11 +81,45 @@ def _build_system_prompt(known_categories, tag_vocabulary):
     return system_prompt
 
 
+def _merge_batch(batch_results, tweet_map):
+    """Turns raw per-item LLM output into final bookmark dicts (original
+    fields + category/summary/tags). Returns (merged_list, skipped_count)."""
+    merged_list = []
+    skipped = 0
+    for item in batch_results:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        original = tweet_map.get(item.get("tweet_id", ""))
+        tags = item.get("tags")
+        if not isinstance(tags, list) or not tags:
+            tags = [RESERVED_FALLBACK_TAG]
+        if original and item.get("category") and item.get("summary"):
+            merged_list.append({
+                **original,
+                "category": item["category"],
+                "summary": item["summary"],
+                "tags": json.dumps(tags),
+            })
+        else:
+            skipped += 1
+    return merged_list, skipped
+
+
 def categorize_bookmarks(bookmarks, existing_categories=None, known_tags=None, on_batch_complete=None):
+    """on_batch_complete, if given, is called as (batch_num, total_batches,
+    usage, batch_merged) after EVERY batch — including ones before a later
+    batch fails. Callers that want to survive a mid-run crash without losing
+    already-completed work (e.g. a bulk backfill) should persist
+    batch_merged immediately inside that callback, rather than waiting for
+    this function's return value, since a batch failure raises out of this
+    function instead of being swallowed."""
     known_categories = list(existing_categories or [])
     tag_vocabulary = sorted(set(SEED_TAGS) | set(known_tags or []))
+    tweet_map = {b["tweet_id"]: b for b in bookmarks}
 
-    categorized = []
+    final = []
+    skipped = 0
     batches = [bookmarks[i:i + BATCH_SIZE] for i in range(0, len(bookmarks), BATCH_SIZE)]
 
     for idx, batch in enumerate(batches, 1):
@@ -93,7 +127,6 @@ def categorize_bookmarks(bookmarks, existing_categories=None, known_tags=None, o
         if not on_batch_complete:
             print(f"Categorizing batch {idx}/{len(batches)} ({len(batch)} posts)...")
         batch_results, usage = _categorize_batch(system_prompt, batch)
-        categorized.extend(batch_results)
 
         # Feed categories invented in this batch back into the running list so
         # the NEXT batch in this same run can reuse them instead of
@@ -103,30 +136,12 @@ def categorize_bookmarks(bookmarks, existing_categories=None, known_tags=None, o
             if isinstance(item, dict) and item.get("category") and item["category"] not in known_categories:
                 known_categories.append(item["category"])
 
-        if on_batch_complete:
-            on_batch_complete(idx, len(batches), usage)
+        batch_merged, batch_skipped = _merge_batch(batch_results, tweet_map)
+        skipped += batch_skipped
+        final.extend(batch_merged)
 
-    tweet_map = {b["tweet_id"]: b for b in bookmarks}
-    final = []
-    skipped = 0
-    for item in categorized:
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
-        original = tweet_map.get(item.get("tweet_id", ""))
-        tags = item.get("tags")
-        if not isinstance(tags, list) or not tags:
-            tags = [RESERVED_FALLBACK_TAG]
-        if original and item.get("category") and item.get("summary"):
-            merged = {
-                **original,
-                "category": item["category"],
-                "summary": item["summary"],
-                "tags": json.dumps(tags),
-            }
-            final.append(merged)
-        else:
-            skipped += 1
+        if on_batch_complete:
+            on_batch_complete(idx, len(batches), usage, batch_merged)
 
     if skipped:
         print(f"\nWARNING: {skipped} items skipped due to missing category/summary in LLM response")

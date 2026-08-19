@@ -52,7 +52,7 @@ def main():
 
     print(f"Categorizing {len(tweets)} bookmarks in {total_batches} batches of {batch_size}...\n")
 
-    def on_batch_complete(batch_num, total, usage):
+    def on_batch_complete(batch_num, total, usage, batch_results=None):
         nonlocal total_input_tokens, total_output_tokens
         total_input_tokens += usage.get("input_tokens", 0)
         total_output_tokens += usage.get("output_tokens", 0)

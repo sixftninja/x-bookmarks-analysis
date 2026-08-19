@@ -5,7 +5,7 @@ load_dotenv()
 
 PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-5")
-MAX_TOKENS = 8096
+MAX_TOKENS = 16000  # batches of 25 posts with category+tags+summary can run long; 8096 was cutting some off mid-response
 
 
 def complete(system: str, messages: list[dict]) -> tuple[str, int, int]:
@@ -39,7 +39,13 @@ def _anthropic(system, messages):
         system=system,
         messages=messages,
     )
-    text = next(block.text for block in response.content if block.type == "text")
+    text = next((block.text for block in response.content if block.type == "text"), None)
+    if text is None:
+        block_types = [block.type for block in response.content]
+        raise RuntimeError(
+            f"Anthropic response had no text block (stop_reason={response.stop_reason}, "
+            f"block types={block_types}) — likely truncated by max_tokens before any text was emitted."
+        )
     return (
         text,
         response.usage.input_tokens,
