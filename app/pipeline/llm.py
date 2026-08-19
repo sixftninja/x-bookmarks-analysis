@@ -5,7 +5,7 @@ load_dotenv()
 
 PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
 MODEL = os.getenv("LLM_MODEL", "claude-sonnet-5")
-MAX_TOKENS = 16000  # batches of 25 posts with category+tags+summary can run long; 8096 was cutting some off mid-response
+MAX_TOKENS = 32000  # batches of 25 posts with category+tags+summary can run long, and this model's responses sometimes include a lengthy thinking block before any text — 8096, then 16000, both got cut off mid-response on some batches
 
 
 def complete(system: str, messages: list[dict]) -> tuple[str, int, int]:
