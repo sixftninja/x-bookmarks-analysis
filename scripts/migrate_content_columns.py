@@ -8,18 +8,20 @@ What it does, in order:
 
 1. Adds the new columns (via app.db.init_db — safe/idempotent).
 2. Classifies every existing row that doesn't have a content_source yet:
-   - In the "Link-Only Posts" category, still just a bare t.co link ->
-     api_teaser_only
+   - In the "Link-Only Posts" category, still broken (empty, or nothing
+     but a bare URL) -> api_teaser_only
    - In "Link-Only Posts" but already has real content (was pasted in by
      hand) -> manual
    - Everything else -> api_text
-2b. Catches stray bare-link rows outside "Link-Only Posts": the
-    categorization AI scattered this same bug across many differently-named
-    categories over time (External Links, AI Development Tools, General
-    Links, ...), so category name alone isn't a reliable signal. Any row
-    anywhere whose full_content is still just a bare t.co link gets
-    reclassified to api_teaser_only regardless of its current category or
-    content_source, so step 3 picks it up too.
+2b. Catches stray broken rows outside "Link-Only Posts": the categorization
+    AI scattered this same bug across many differently-named categories
+    over time (External Links, AI Development Tools, General Links, ...),
+    so category name alone isn't a reliable signal — and "broken" isn't
+    just t.co links either (empty full_content and bare non-Twitter URLs
+    both showed up in production data too). Any row anywhere whose
+    full_content is still broken by that definition gets reclassified to
+    api_teaser_only regardless of its current category or content_source,
+    so step 3 picks it up too.
 3. Retries every api_teaser_only row through the new HTML-scrape pipeline
    (app.pipeline.fetch.enrich_tweet_content). Success -> full_content,
    content_source, image_processing_status, quoted_tweet_id all get updated.
@@ -34,15 +36,14 @@ What it does, in order:
    where it left off instead of silently skipping them.
 
 Safe to re-run: classification only touches rows where content_source IS
-NULL, the stray-bare-link reclassification only touches rows that are
-still literally a bare link, and the backfill/recategorize steps only
-touch rows still in the states they target.
+NULL, the stray-broken-row reclassification only touches rows that are
+still genuinely broken, and the backfill/recategorize steps only touch
+rows still in the states they target.
 
 Usage:
     python scripts/migrate_content_columns.py
 """
 import os
-import re
 import sqlite3
 import sys
 import time
@@ -54,11 +55,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.db import init_db, get_categories
-from app.pipeline.fetch import enrich_tweet_content
+from app.pipeline.fetch import enrich_tweet_content, is_bare_url_only
 from app.pipeline.categorize import categorize_bookmarks
 
 LINK_ONLY_CATEGORY = "link-only posts"
-BARE_LINK_RE = re.compile(r"^https://t\.co/\w+$")
+
+
+def _is_broken_content(content):
+    """"Broken", broadly: nothing at all, or a single bare URL and nothing
+    else — whether that's an X t.co short link or a plain external URL
+    pasted with no surrounding text (e.g. "arxiv.org/pdf/2509.14252").
+    Bare-URL detection is shared with app.pipeline.fetch, which also uses
+    it to try resolving such links (e.g. PDFs) instead of leaving them."""
+    text = (content or "").strip()
+    return (not text) or is_bare_url_only(text)
 
 
 def _categorize_with_retries(bookmarks, existing_categories, attempts=3, base_delay=5):
@@ -84,9 +94,8 @@ def _classify_existing_rows(db_path):
 
         updates = []
         for tweet_id, category, full_content in rows:
-            content = (full_content or "").strip()
             if (category or "").strip().lower() == LINK_ONLY_CATEGORY:
-                content_source = "api_teaser_only" if BARE_LINK_RE.match(content) else "manual"
+                content_source = "api_teaser_only" if _is_broken_content(full_content) else "manual"
             else:
                 content_source = "api_text"
             updates.append((content_source, "no_images_found", tweet_id))
@@ -106,10 +115,12 @@ def _classify_existing_rows(db_path):
 
 def _reclassify_stray_bare_links(db_path):
     """Category name alone isn't a reliable signal for "this row is still
-    broken" — the categorization AI scattered the bare-link bug across many
-    differently-named categories, not just "Link-Only Posts". Find any row,
-    anywhere, whose full_content is still just a bare t.co link and flag it
-    api_teaser_only so the backfill step below picks it up too."""
+    broken" — the categorization AI scattered this bug across many
+    differently-named categories, not just "Link-Only Posts", and it isn't
+    just t.co links either (empty full_content, bare non-Twitter URLs like
+    a pasted-in arxiv link, both showed up too). Find any row, anywhere,
+    whose full_content is still broken by that broader definition and flag
+    it api_teaser_only so the backfill step below picks it up too."""
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
             "SELECT tweet_id, full_content, content_source FROM bookmarks"
@@ -118,9 +129,7 @@ def _reclassify_stray_bare_links(db_path):
         stray_ids = [
             tweet_id
             for tweet_id, full_content, content_source in rows
-            if content_source != "api_teaser_only"
-            and full_content
-            and BARE_LINK_RE.match(full_content.strip())
+            if content_source != "api_teaser_only" and _is_broken_content(full_content)
         ]
 
         if stray_ids:
@@ -130,7 +139,7 @@ def _reclassify_stray_bare_links(db_path):
             )
             conn.commit()
 
-    print(f"Reclassified {len(stray_ids)} stray bare-link row(s) outside 'Link-Only Posts' as api_teaser_only.")
+    print(f"Reclassified {len(stray_ids)} stray broken row(s) outside 'Link-Only Posts' as api_teaser_only.")
     return len(stray_ids)
 
 

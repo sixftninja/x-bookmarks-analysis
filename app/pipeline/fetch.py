@@ -16,6 +16,7 @@ BASE_URL = "https://api.x.com/2"
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 ARTICLE_HREF_RE = re.compile(r"^/i/article/\d+")
 BARE_LINK_RE = re.compile(r"^https://t\.co/\w+$")
+BARE_URL_ONLY_RE = re.compile(r"^(https?://|www\.)?[\w.-]+\.[a-z]{2,}(/\S*)?$", re.IGNORECASE)
 HANDLE_HREF_RE = re.compile(r"^/([A-Za-z0-9_]{1,15})$")
 ARTICLE_LEN_THRESHOLD = 1500  # chars — signals a tweet's own status page already inlines a full article body
 
@@ -28,7 +29,18 @@ _STAT_LINE_RE = re.compile(r"^[\d.,]+[KM]?$")
 _TIME_LINE_RE = re.compile(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*[·\-]")
 
 OPENAI_VISION_MODEL = "gpt-4o"
+OPENAI_TEXT_MODEL = "gpt-4o"
 ANTHROPIC_VISION_MODEL = "claude-sonnet-5"
+
+PDF_ABSTRACT_INSTRUCTION = (
+    "You will be given text extracted from the first pages of a PDF. "
+    "Determine whether this PDF is an academic/research paper (has an "
+    "abstract, authors, citations, academic structure) as opposed to "
+    "something else (a slide deck, product one-pager, blog export, report, "
+    "etc). If it IS a research paper: reply with ONLY the abstract text, "
+    "verbatim, nothing else — no preamble, no 'Abstract:' label. If it is "
+    "NOT a research paper: reply with exactly the single word NO."
+)
 
 VISION_INSTRUCTION = (
     "You are continuing a piece of writing at the exact point an image appeared. "
@@ -183,6 +195,101 @@ def _scrape_article_page(article_url):
     return (text, []) if text else (None, [])
 
 
+def is_bare_url_only(text):
+    """True if text is nothing but a single bare URL and no other content.
+    Shared with scripts/migrate_content_columns.py."""
+    stripped = (text or "").strip()
+    return bool(stripped) and bool(BARE_URL_ONLY_RE.match(stripped))
+
+
+def _fetch_pdf_bytes_if_pdf(url):
+    try:
+        resp = httpx.get(url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").lower()
+        if "application/pdf" in content_type or resp.content[:5] == b"%PDF-":
+            return resp.content
+    except Exception as e:
+        print(f"PDF check failed for {url}: {e}")
+    return None
+
+
+def _extract_pdf_text(pdf_bytes, max_pages=4):
+    import io
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages = reader.pages[:max_pages]
+    return "\n".join((p.extract_text() or "") for p in pages)
+
+
+def _classify_and_extract_abstract(pdf_text):
+    """OpenAI decides, on the fly, whether a PDF is a research paper and (if
+    so) returns just its abstract. Per explicit product decision: no
+    Anthropic fallback here — if OpenAI can't decide, treat it the same as
+    "not a research paper" rather than leaving the bookmark unresolved."""
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = client.chat.completions.create(
+            model=OPENAI_TEXT_MODEL,
+            max_tokens=800,
+            messages=[
+                {"role": "system", "content": PDF_ABSTRACT_INSTRUCTION},
+                {"role": "user", "content": pdf_text[:12000]},
+            ],
+        )
+        text = resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"PDF abstract classification failed: {e}")
+        return None
+    return None if (not text or text.upper() == "NO") else text
+
+
+def _resolve_bare_url_pdf(text):
+    """If text is nothing but a bare URL and that URL serves a PDF, returns
+    replacement text: the paper's abstract if it's a research paper, else an
+    explanatory placeholder. Returns None if text isn't a bare URL, the URL
+    isn't actually a PDF, or extraction fails — callers should keep the
+    original text in that case."""
+    stripped = text.strip()
+    if not is_bare_url_only(stripped):
+        return None
+
+    url = stripped if stripped.startswith("http") else f"https://{stripped}"
+    pdf_bytes = _fetch_pdf_bytes_if_pdf(url)
+    if not pdf_bytes:
+        return None
+
+    not_a_paper_message = (
+        f"This link leads to a PDF which doesn't seem to be a research paper, "
+        f"hence only retaining the link: {url}"
+    )
+
+    try:
+        pdf_text = _extract_pdf_text(pdf_bytes)
+    except Exception as e:
+        print(f"PDF text extraction failed for {url}: {e}")
+        return not_a_paper_message
+
+    if not pdf_text.strip():
+        return not_a_paper_message
+
+    abstract = _classify_and_extract_abstract(pdf_text)
+    return abstract if abstract else not_a_paper_message
+
+
+def _finalize_short_text(text, image_urls):
+    """For short (non-article) block text: if it's literally just a bare
+    URL, try resolving it as a PDF instead of leaving a dead link as the
+    final content."""
+    resolved = _resolve_bare_url_pdf(text)
+    if resolved:
+        return {"text": resolved, "scraped": True, "image_urls": image_urls}
+    return {"text": text, "scraped": False, "image_urls": image_urls}
+
+
 def _process_block(block, exclude_id, clean_text_fallback=None):
     """Returns {"text", "scraped", "image_urls"} for one tweet block (primary
     or quoted). Follows an /i/article/ link if present; otherwise, for the
@@ -211,10 +318,10 @@ def _process_block(block, exclude_id, clean_text_fallback=None):
         return {"text": _strip_chrome(raw_text, handle), "scraped": True, "image_urls": image_urls}
 
     if clean_text_fallback:
-        return {"text": clean_text_fallback, "scraped": False, "image_urls": image_urls}
+        return _finalize_short_text(clean_text_fallback, image_urls)
 
     handle = _extract_handle(block)
-    return {"text": _strip_chrome(raw_text, handle), "scraped": False, "image_urls": image_urls}
+    return _finalize_short_text(_strip_chrome(raw_text, handle), image_urls)
 
 
 # ---------------------------------------------------------------------------
