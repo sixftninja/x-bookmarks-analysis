@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import os
 from dotenv import load_dotenv
@@ -21,7 +22,8 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     categorized_at TEXT DEFAULT (datetime('now')),
     content_source TEXT,
     image_processing_status TEXT,
-    quoted_tweet_id TEXT
+    quoted_tweet_id TEXT,
+    tags TEXT
 );
 """
 
@@ -32,6 +34,7 @@ _ADDED_COLUMNS = [
     ("content_source", "TEXT"),
     ("image_processing_status", "TEXT"),
     ("quoted_tweet_id", "TEXT"),
+    ("tags", "TEXT"),  # JSON array of strings, e.g. '["Open Source", "Cloud Hosting & Inference Costs"]'
 ]
 
 CREATE_SYNC_LOG = """
@@ -86,18 +89,37 @@ def insert_bookmarks(bookmarks, db_path=DEFAULT_DB):
         INSERT OR IGNORE INTO bookmarks
             (tweet_id, author_username, author_name, category, summary,
              full_content, media_urls, tweet_url, bookmarked_at,
-             content_source, image_processing_status, quoted_tweet_id)
+             content_source, image_processing_status, quoted_tweet_id, tags)
         VALUES
             (:tweet_id, :author_username, :author_name, :category, :summary,
              :full_content, :media_urls, :tweet_url, :bookmarked_at,
-             :content_source, :image_processing_status, :quoted_tweet_id)
+             :content_source, :image_processing_status, :quoted_tweet_id, :tags)
     """
-    defaults = {"content_source": "api_text", "image_processing_status": "no_images_found", "quoted_tweet_id": None}
+    defaults = {
+        "content_source": "api_text",
+        "image_processing_status": "no_images_found",
+        "quoted_tweet_id": None,
+        "tags": "[]",
+    }
     rows = [{**defaults, **b} for b in bookmarks]
     with sqlite3.connect(db_path) as conn:
         cursor = conn.executemany(sql, rows)
         conn.commit()
         return cursor.rowcount
+
+
+def get_all_tags(db_path=DEFAULT_DB):
+    """Every tag currently in use across all bookmarks, deduped and sorted.
+    This — not any separate registry — is the live tag vocabulary."""
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT tags FROM bookmarks WHERE tags IS NOT NULL").fetchall()
+    tags = set()
+    for (raw,) in rows:
+        try:
+            tags.update(json.loads(raw) or [])
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return sorted(tags)
 
 
 def get_existing_tweet_ids(db_path=DEFAULT_DB):

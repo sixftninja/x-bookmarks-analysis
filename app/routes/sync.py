@@ -19,6 +19,7 @@ async def _run_pipeline():
     from app.db import (
         get_existing_tweet_ids,
         get_categories,
+        get_all_tags,
         insert_bookmarks,
         log_sync,
     )
@@ -35,8 +36,9 @@ async def _run_pipeline():
         return {"status": "ok", "new_bookmarks": 0, "message": "No new bookmarks found"}
 
     existing_cats = await loop.run_in_executor(None, get_categories, db_path)
+    known_tags = await loop.run_in_executor(None, get_all_tags, db_path)
     categorized = await loop.run_in_executor(
-        None, lambda: categorize_bookmarks(new_tweets, existing_categories=existing_cats)
+        None, lambda: categorize_bookmarks(new_tweets, existing_categories=existing_cats, known_tags=known_tags)
     )
 
     count = await loop.run_in_executor(

@@ -54,7 +54,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.db import init_db, get_categories
+from app.db import init_db, get_categories, get_all_tags
 from app.pipeline.fetch import enrich_tweet_content, is_bare_url_only
 from app.pipeline.categorize import categorize_bookmarks
 
@@ -71,13 +71,14 @@ def _is_broken_content(content):
     return (not text) or is_bare_url_only(text)
 
 
-def _categorize_with_retries(bookmarks, existing_categories, attempts=3, base_delay=5):
+def _categorize_with_retries(bookmarks, existing_categories, db_path, attempts=3, base_delay=5):
     """categorize_bookmarks() hits a real LLM API — retry a few times on
     transient network errors (DNS blips, connection resets) rather than
     letting one flaky call kill the whole migration run."""
+    known_tags = get_all_tags(db_path)
     for attempt in range(1, attempts + 1):
         try:
-            return categorize_bookmarks(bookmarks, existing_categories=existing_categories)
+            return categorize_bookmarks(bookmarks, existing_categories=existing_categories, known_tags=known_tags)
         except Exception as e:
             if attempt == attempts:
                 raise
@@ -188,15 +189,16 @@ def _backfill_teaser_only_rows(db_path):
         recategorized = _categorize_with_retries(
             [{"tweet_id": tweet_id, "full_content": full, "author_username": author_username}],
             existing_categories=existing_categories,
+            db_path=db_path,
         )
         if recategorized:
             with sqlite3.connect(db_path) as conn:
                 conn.execute(
-                    "UPDATE bookmarks SET category = ?, summary = ?, categorized_at = datetime('now') WHERE tweet_id = ?",
-                    (recategorized[0]["category"], recategorized[0]["summary"], tweet_id),
+                    "UPDATE bookmarks SET category = ?, summary = ?, tags = ?, categorized_at = datetime('now') WHERE tweet_id = ?",
+                    (recategorized[0]["category"], recategorized[0]["summary"], recategorized[0]["tags"], tweet_id),
                 )
                 conn.commit()
-            print(f"  {tweet_id}: recategorized -> {recategorized[0]['category']}")
+            print(f"  {tweet_id}: recategorized -> {recategorized[0]['category']} (tags: {recategorized[0]['tags']})")
         else:
             print(f"  {tweet_id}: recategorization returned no result, category/summary left as-is")
 
@@ -219,12 +221,12 @@ def _recategorize_manual_rows(db_path):
     bookmarks = [{"tweet_id": tid, "author_username": u, "full_content": c} for tid, u, c in rows]
     print(f"Recategorizing {len(bookmarks)} manual row(s)...")
     existing_categories = get_categories(db_path)
-    recategorized = _categorize_with_retries(bookmarks, existing_categories=existing_categories)
+    recategorized = _categorize_with_retries(bookmarks, existing_categories=existing_categories, db_path=db_path)
 
     with sqlite3.connect(db_path) as conn:
         conn.executemany(
-            "UPDATE bookmarks SET category = ?, summary = ?, categorized_at = datetime('now') WHERE tweet_id = ?",
-            [(b["category"], b["summary"], b["tweet_id"]) for b in recategorized],
+            "UPDATE bookmarks SET category = ?, summary = ?, tags = ?, categorized_at = datetime('now') WHERE tweet_id = ?",
+            [(b["category"], b["summary"], b["tags"], b["tweet_id"]) for b in recategorized],
         )
         conn.commit()
     print(f"Recategorized {len(recategorized)} manual row(s).")

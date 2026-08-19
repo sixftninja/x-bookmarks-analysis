@@ -7,7 +7,7 @@ load_dotenv()
 from app.pipeline.fetch import fetch_bookmarks
 from app.pipeline.categorize import categorize_bookmarks
 from app.pipeline.llm import PROVIDER, MODEL
-from app.db import init_db, get_existing_tweet_ids, insert_bookmarks, get_categories, log_sync
+from app.db import init_db, get_existing_tweet_ids, insert_bookmarks, get_categories, get_all_tags, log_sync
 
 _input_price = os.getenv("LLM_INPUT_PRICE_MTOK")
 _output_price = os.getenv("LLM_OUTPUT_PRICE_MTOK")
@@ -42,6 +42,7 @@ def main():
         return
 
     cats = get_categories(db)
+    tags = get_all_tags(db)
     batch_size = 25
     total_batches = (len(tweets) + batch_size - 1) // batch_size
 
@@ -83,7 +84,7 @@ def main():
             flush=True,
         )
 
-    categorized = categorize_bookmarks(tweets, existing_categories=cats, on_batch_complete=on_batch_complete)
+    categorized = categorize_bookmarks(tweets, existing_categories=cats, known_tags=tags, on_batch_complete=on_batch_complete)
     print()  # newline after progress line
 
     categorize_elapsed = time.time() - categorize_start

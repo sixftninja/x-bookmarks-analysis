@@ -31,6 +31,7 @@ _TIME_LINE_RE = re.compile(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*[·\-]")
 OPENAI_VISION_MODEL = "gpt-4o"
 OPENAI_TEXT_MODEL = "gpt-4o"
 ANTHROPIC_VISION_MODEL = "claude-sonnet-5"
+ANTHROPIC_TEXT_MODEL = "claude-sonnet-5"
 
 PDF_ABSTRACT_INSTRUCTION = (
     "You will be given text extracted from the first pages of a PDF. "
@@ -223,27 +224,54 @@ def _extract_pdf_text(pdf_bytes, max_pages=4):
     return "\n".join((p.extract_text() or "") for p in pages)
 
 
-def _classify_and_extract_abstract(pdf_text):
-    """OpenAI decides, on the fly, whether a PDF is a research paper and (if
-    so) returns just its abstract. Per explicit product decision: no
-    Anthropic fallback here — if OpenAI can't decide, treat it the same as
-    "not a research paper" rather than leaving the bookmark unresolved."""
-    try:
-        from openai import OpenAI
+def _classify_and_extract_abstract_openai(pdf_text):
+    from openai import OpenAI
 
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        resp = client.chat.completions.create(
-            model=OPENAI_TEXT_MODEL,
-            max_tokens=800,
-            messages=[
-                {"role": "system", "content": PDF_ABSTRACT_INSTRUCTION},
-                {"role": "user", "content": pdf_text[:12000]},
-            ],
-        )
-        text = resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"PDF abstract classification failed: {e}")
-        return None
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model=OPENAI_TEXT_MODEL,
+        max_tokens=800,
+        messages=[
+            {"role": "system", "content": PDF_ABSTRACT_INSTRUCTION},
+            {"role": "user", "content": pdf_text[:12000]},
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def _classify_and_extract_abstract_anthropic(pdf_text):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    resp = client.messages.create(
+        model=ANTHROPIC_TEXT_MODEL,
+        max_tokens=800,
+        system=PDF_ABSTRACT_INSTRUCTION,
+        messages=[{"role": "user", "content": pdf_text[:12000]}],
+    )
+    return next(b.text for b in resp.content if b.type == "text").strip()
+
+
+def _classify_and_extract_abstract(pdf_text):
+    """Decides, on the fly, whether a PDF is a research paper and (if so)
+    returns just its abstract. OpenAI first, Anthropic fallback — if neither
+    can decide, treat it the same as "not a research paper" rather than
+    leaving the bookmark unresolved."""
+    text = None
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            text = _classify_and_extract_abstract_openai(pdf_text)
+        except Exception as e:
+            print(f"PDF abstract classification (OpenAI) failed: {e}")
+    else:
+        print("PDF abstract classification: OPENAI_API_KEY not set, skipping to Anthropic fallback")
+
+    if text is None and os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            text = _classify_and_extract_abstract_anthropic(pdf_text)
+        except Exception as e:
+            print(f"PDF abstract classification (Anthropic fallback) failed: {e}")
+
     return None if (not text or text.upper() == "NO") else text
 
 

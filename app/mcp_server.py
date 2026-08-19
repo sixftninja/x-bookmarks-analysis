@@ -1,12 +1,27 @@
+import json
 import os
 import sqlite3
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("X Bookmarks")
 
+BOOKMARK_FIELDS = (
+    "tweet_id, author_username, author_name, category, summary, full_content, "
+    "tweet_url, bookmarked_at, content_source, image_processing_status, tags"
+)
+
 
 def _db():
     return os.getenv("DATABASE_URL", "./bookmarks.db")
+
+
+def _row_with_parsed_tags(row):
+    d = dict(row)
+    try:
+        d["tags"] = json.loads(d["tags"]) if d.get("tags") else []
+    except (json.JSONDecodeError, TypeError):
+        d["tags"] = []
+    return d
 
 
 @mcp.tool()
@@ -156,7 +171,7 @@ def trigger_sync() -> dict:
     from app.pipeline.auth import get_valid_access_token
     from app.pipeline.fetch import fetch_bookmarks
     from app.pipeline.categorize import categorize_bookmarks
-    from app.db import get_existing_tweet_ids, get_categories, insert_bookmarks, log_sync
+    from app.db import get_existing_tweet_ids, get_categories, get_all_tags, insert_bookmarks, log_sync
 
     db_path = _db()
     try:
@@ -169,7 +184,8 @@ def trigger_sync() -> dict:
             return {"status": "ok", "new_bookmarks": 0, "message": "No new bookmarks found"}
 
         existing_cats = get_categories(db_path)
-        categorized = categorize_bookmarks(new_tweets, existing_categories=existing_cats)
+        known_tags = get_all_tags(db_path)
+        categorized = categorize_bookmarks(new_tweets, existing_categories=existing_cats, known_tags=known_tags)
         count = insert_bookmarks(categorized, db_path)
         log_sync(count, "success", None, db_path)
 
@@ -204,3 +220,118 @@ def edit_bookmark(tweet_id: str, category: str = None, summary: str = None, full
         )
         conn.commit()
     return {"updated": tweet_id, "category": category, "summary": summary, "full_content": full_content}
+
+
+@mcp.tool()
+def get_bookmark_by_tweet_id(tweet_id: str) -> dict:
+    """Get a single bookmark by its exact tweet_id. Returns an error if not found."""
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            f"SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE tweet_id = ?",
+            (tweet_id,),
+        ).fetchone()
+    if row is None:
+        return {"error": f"No bookmark found with tweet_id {tweet_id}"}
+    return _row_with_parsed_tags(row)
+
+
+@mcp.tool()
+def get_bookmarks_by_author(author_username: str, limit: int = 50) -> list[dict]:
+    """Get bookmarks from a specific X author. Case-insensitive, matches with or without the @ sign."""
+    handle = author_username.lstrip("@")
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE LOWER(author_username) = LOWER(?)
+               ORDER BY bookmarked_at DESC LIMIT ?""",
+            (handle, min(limit, 200)),
+        ).fetchall()
+    return [_row_with_parsed_tags(row) for row in rows]
+
+
+@mcp.tool()
+def get_authors() -> list[dict]:
+    """Get every author with a bookmark, and how many bookmarks each has, sorted by count descending."""
+    with sqlite3.connect(_db()) as conn:
+        rows = conn.execute(
+            "SELECT author_username, COUNT(*) as count FROM bookmarks GROUP BY author_username ORDER BY count DESC"
+        ).fetchall()
+    return [{"author_username": row[0], "count": row[1]} for row in rows]
+
+
+@mcp.tool()
+def get_bookmarks_by_content_source(content_source: str, limit: int = 50) -> list[dict]:
+    """Get bookmarks by content_source: api_text, api_scraped_article, manual, or api_teaser_only (still broken/unresolved)."""
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE content_source = ?
+               ORDER BY bookmarked_at DESC LIMIT ?""",
+            (content_source, min(limit, 200)),
+        ).fetchall()
+    return [_row_with_parsed_tags(row) for row in rows]
+
+
+@mcp.tool()
+def get_bookmarks_by_image_processing_status(image_processing_status: str, limit: int = 50) -> list[dict]:
+    """Get bookmarks by image_processing_status: images_appended_successfully, images_partially_appended, images_fetch_failed, or no_images_found."""
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE image_processing_status = ?
+               ORDER BY bookmarked_at DESC LIMIT ?""",
+            (image_processing_status, min(limit, 200)),
+        ).fetchall()
+    return [_row_with_parsed_tags(row) for row in rows]
+
+
+@mcp.tool()
+def get_bookmarks_by_tag(tags: list[str], match_all: bool = True, limit: int = 50) -> list[dict]:
+    """Get bookmarks carrying one or more tags. match_all=True (default) requires every listed tag
+    to be present (AND); match_all=False returns bookmarks with any of the listed tags (OR).
+    Pass tags=["Uncategorized"] to find bookmarks still needing a real tag assigned."""
+    wanted = set(tags)
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE tags IS NOT NULL ORDER BY bookmarked_at DESC"
+        ).fetchall()
+
+    matched = []
+    for row in rows:
+        parsed = _row_with_parsed_tags(row)
+        have = set(parsed["tags"])
+        hit = wanted.issubset(have) if match_all else bool(wanted & have)
+        if hit:
+            matched.append(parsed)
+        if len(matched) >= min(limit, 200):
+            break
+    return matched
+
+
+@mcp.tool()
+def add_tag_to_bookmark(tweet_id: str, tag: str) -> dict:
+    """Add a tag to a bookmark's tag list (no duplicates). If the bookmark's only tag was
+    "Uncategorized", the new real tag replaces it. Use this after a human approves a tag
+    suggestion — this is the only way new tags should enter the vocabulary."""
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT tags FROM bookmarks WHERE tweet_id = ?", (tweet_id,)).fetchone()
+        if row is None:
+            return {"error": f"No bookmark found with tweet_id {tweet_id}"}
+
+        try:
+            current = json.loads(row["tags"]) if row["tags"] else []
+        except (json.JSONDecodeError, TypeError):
+            current = []
+
+        if tag not in current:
+            current = [t for t in current if t != "Uncategorized"] + [tag]
+
+        conn.execute(
+            "UPDATE bookmarks SET tags = ? WHERE tweet_id = ?",
+            (json.dumps(current), tweet_id),
+        )
+        conn.commit()
+    return {"updated": tweet_id, "tags": current}
