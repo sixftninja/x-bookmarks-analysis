@@ -1,6 +1,6 @@
 # X Bookmarks Analysis
 
-I built this to automatically fetch, categorize, and search my X bookmarks using AI. Every bookmark gets a category and a ~128 word summary written by LLM of your choice. I can search, filter, and manage everything conversationally from any device.
+I built this to automatically fetch, categorize, and search my X bookmarks using AI. Every bookmark gets a category, one or more topic tags, and a ~128 word summary written by LLM of your choice. Article-only "teaser" posts get their full body scraped, quote-tweets get the quoted content merged in, images get described in text, and bare PDF links get resolved to a real abstract (or a plain note if it isn't a paper). I can search, filter, and manage everything conversationally from any device.
 
 ---
 
@@ -67,6 +67,8 @@ Provider options and their required API key variable:
 | Meta (Llama) | `meta` | `META_API_KEY` | llama.com |
 
 Set `LLM_MODEL` to any model name your chosen provider supports (e.g. `gpt-4o`, `gemini-2.0-flash`, `grok-3`, `llama3.1-70b-instruct`). The pricing vars are optional — if omitted, cost won't be shown in sync output.
+
+**Image descriptions and PDF-abstract extraction use `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` directly**, separately from whatever `LLM_PROVIDER` you picked for categorization — OpenAI is tried first, Anthropic as a fallback. Set at least one; both is safest. Without either, image-bearing and PDF-link bookmarks still sync, just without a description/abstract.
 
 ### 3. Authorize with X (one-time)
 
@@ -165,8 +167,15 @@ You can then ask Claude things like:
 - *"Rename category 'External Links' to 'Unread Articles'"*
 - *"Merge 'Link Shares' and 'Link-Only Posts' into 'Bare Links'"*
 - *"Move these bookmarks to a new category called 'AI Infrastructure'"*
+- *"Show me everything tagged Open Source AI and Cloud Hosting & Inference Costs at once"*
+- *"Pull up my Uncategorized bookmarks and suggest a tag for each"*
+- *"What has karpathy posted that I've bookmarked?"*
 
-**Available tools:** `get_bookmark_stats`, `get_categories`, `get_bookmarks_by_category`, `search_bookmarks`, `get_recent_bookmarks`, `get_sync_status`, `trigger_sync`, `rename_category`, `move_bookmarks`, `merge_categories`, `delete_bookmarks`, `delete_category`, `edit_bookmark`
+**Available tools:** `get_bookmark_stats`, `get_categories`, `get_bookmarks_by_category`, `search_bookmarks`, `get_recent_bookmarks`, `get_sync_status`, `trigger_sync`, `rename_category`, `move_bookmarks`, `merge_categories`, `delete_bookmarks`, `delete_category`, `edit_bookmark`, `get_bookmark_by_tweet_id`, `get_bookmarks_by_author`, `get_authors`, `get_bookmarks_by_content_source`, `get_bookmarks_by_image_processing_status`, `get_bookmarks_by_tag`, `add_tag_to_bookmark`
+
+### Tags
+
+Each bookmark can carry several tags at once (e.g. a post can be both "Open Source AI" and "Cloud Hosting & Inference Costs"), pulled from a fixed, curated vocabulary rather than invented per-post — that vocabulary only grows deliberately, when you approve a new one. Anything that doesn't fit an existing tag gets `"Uncategorized"` instead of forcing a bad fit; ask any connected AI to pull those up (`get_bookmarks_by_tag(["Uncategorized"])`) and suggest tags for you to approve.
 
 ---
 
