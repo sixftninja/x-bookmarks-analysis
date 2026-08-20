@@ -8,7 +8,8 @@ I built this to automatically fetch, categorize, and search my X bookmarks using
 
 - Python 3.11+
 - [X Developer account](https://developer.x.com) with API access — requires a paid Basic tier or higher ([X API pricing](https://developer.x.com/en/products/twitter-api), [subscription plans](https://developer.twitter.com/en/portal/products))
-- An LLM API key — Anthropic, OpenAI, Google, xAI, or Meta (defaults to Claude)
+- An LLM API key for categorization — Anthropic, OpenAI, Google, xAI, or Meta (defaults to Claude)
+- An Anthropic and/or OpenAI key for image descriptions and PDF-abstract extraction — these always try OpenAI first regardless of the categorization provider above, with Anthropic as fallback
 
 ---
 
