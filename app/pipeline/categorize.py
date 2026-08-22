@@ -44,6 +44,16 @@ SEED_TAGS = [
 
 RESERVED_FALLBACK_TAG = "Uncategorized"
 
+# Reserved category for posts whose own text is minimal-to-nonexistent — a
+# short reaction plus a link/image/video attachment, with no real topic to
+# infer even after any image gets described. Distinct from the old
+# "Link-Only Posts" bug category (that one meant BROKEN: content recovery
+# failed entirely). This one means recovery succeeded and the content is
+# just genuinely thin — forcing it into an unrelated topical category
+# (e.g. "Development Tools" for "This is so cool! [link]") was worse than
+# naming what it actually is.
+RESERVED_THIN_CONTENT_CATEGORY = "Minimal-Content Posts"
+
 BASE_SYSTEM_PROMPT = """You are analyzing a collection of bookmarked posts from X (Twitter). Your job is to:
 1. Identify meaningful, specific categories that reflect the actual content themes
 2. Assign each post to exactly one category
@@ -54,6 +64,7 @@ Category rules:
 - Create 5-15 categories maximum, depending on content diversity
 - Category names must be specific (e.g. "AI Safety Research", "Startup GTM Strategy") not generic (e.g. "Interesting", "Tech", "Other")
 - Group posts by their broad underlying subject/topic, not by surface wording. Two posts can use completely different vocabulary and examples and still belong in the same category if they're fundamentally about the same thing (e.g. a post about LangGraph agent loops and a post about Claude Code subagent orchestration are both "AI Agent Harness Design", even though they don't share terminology)
+- If a post's own text is minimal (a short reaction, a caption, or barely anything) and the actual content is mostly a link, image, or video with no substantive written topic to infer, assign category exactly "{thin_category}" instead of forcing it into an unrelated topical category
 
 Summary rules:
 - Summaries must capture what the post actually argues or reveals, not just describe it
@@ -75,7 +86,8 @@ INCREMENTAL_EXTRA = "\n- You have these existing categories: {categories}. Assig
 
 
 def _build_system_prompt(known_categories, tag_vocabulary):
-    system_prompt = BASE_SYSTEM_PROMPT + TAGS_INSTRUCTION.format(tags=tag_vocabulary)
+    system_prompt = BASE_SYSTEM_PROMPT.format(thin_category=RESERVED_THIN_CONTENT_CATEGORY)
+    system_prompt += TAGS_INSTRUCTION.format(tags=tag_vocabulary)
     if known_categories:
         system_prompt += INCREMENTAL_EXTRA.format(categories=known_categories)
     return system_prompt

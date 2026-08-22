@@ -543,6 +543,49 @@ def enrich_tweet_content(api_text, author_username, tweet_id):
     return api_text, content_source, "no_images_found", None
 
 
+def backfill_missing_images(author_username, tweet_id, existing_full_content):
+    """For a bookmark synced before the image-description pipeline existed:
+    fetch the tweet's own status page, find any content images ON THE
+    PRIMARY TWEET ONLY (never the quoted tweet's — these bookmarks predate
+    quote-tweet handling entirely, so there's no established quoted-tweet
+    section in existing_full_content to append into), describe them, and
+    append. Doesn't touch anything else — no article/quote-tweet detection,
+    no text changes beyond the append.
+
+    Returns (new_full_content, image_processing_status), or None if no
+    fetchable images were found (page unreachable, or nothing there
+    anymore) — caller should leave the row untouched in that case."""
+    if not author_username:
+        return None
+
+    tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
+    try:
+        resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Fetch failed for {tweet_url}: {e}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    primary_block = soup.find("article", attrs={"data-tweet-id": tweet_id})
+    if primary_block is None:
+        return None
+
+    quoted_block = primary_block.find("article", attrs={"data-tweet-id": True})
+    quoted_id = quoted_block.get("data-tweet-id") if quoted_block else None
+
+    image_urls = _find_content_images(primary_block, exclude_id=quoted_id)
+    if not image_urls:
+        return None
+
+    appended, image_status = _describe_and_append_images(image_urls)
+    if not appended:
+        return None
+
+    new_content = f"{existing_full_content}\n\n{appended}".strip()
+    return new_content, image_status
+
+
 def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
     if db_path is None:
         db_path = os.getenv("DATABASE_URL", "./bookmarks.db")
