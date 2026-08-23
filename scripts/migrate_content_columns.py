@@ -174,7 +174,7 @@ def _backfill_teaser_only_rows(db_path):
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """UPDATE bookmarks
-                   SET full_content = ?, content_source = ?, image_processing_status = ?, quoted_tweet_id = ?
+                   SET full_content = ?, content_source = ?, image_processing_status = ?, quoted_from_tweet_id = ?
                    WHERE tweet_id = ?""",
                 (full, content_source, image_status, quoted_id, tweet_id),
             )

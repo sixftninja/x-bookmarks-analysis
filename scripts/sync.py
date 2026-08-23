@@ -41,16 +41,24 @@ def main():
         log_sync(0, "success", None, db)
         return
 
+    # Rows with a real content_for_summary need the LLM; rows already
+    # resolved deterministically (nothing substantial anywhere) skip it
+    # entirely — see resolve_bookmark_rows / RESERVED_THIN_CONTENT_CATEGORY.
+    needs_categorization = [t for t in tweets if "category" not in t]
+    already_resolved = [t for t in tweets if "category" in t]
+    if already_resolved:
+        print(f"{len(already_resolved)} of {len(tweets)} bookmark(s) had nothing substantial anywhere — skipping the LLM for those.\n")
+
     cats = get_categories(db)
     tags = get_all_tags(db)
     batch_size = 25
-    total_batches = (len(tweets) + batch_size - 1) // batch_size
+    total_batches = (len(needs_categorization) + batch_size - 1) // batch_size
 
     total_input_tokens = 0
     total_output_tokens = 0
     categorize_start = time.time()
 
-    print(f"Categorizing {len(tweets)} bookmarks in {total_batches} batches of {batch_size}...\n")
+    print(f"Categorizing {len(needs_categorization)} bookmarks in {total_batches} batches of {batch_size}...\n")
 
     def on_batch_complete(batch_num, total, usage, batch_results=None):
         nonlocal total_input_tokens, total_output_tokens
@@ -84,11 +92,14 @@ def main():
             flush=True,
         )
 
-    categorized = categorize_bookmarks(tweets, existing_categories=cats, known_tags=tags, on_batch_complete=on_batch_complete)
+    categorized = (
+        categorize_bookmarks(needs_categorization, existing_categories=cats, known_tags=tags, on_batch_complete=on_batch_complete)
+        if needs_categorization else []
+    )
     print()  # newline after progress line
 
     categorize_elapsed = time.time() - categorize_start
-    count = insert_bookmarks(categorized, db)
+    count = insert_bookmarks(categorized + already_resolved, db)
     log_sync(count, "success", None, db)
 
     total_elapsed = time.time() - overall_start

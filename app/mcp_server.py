@@ -6,11 +6,13 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("X Bookmarks")
 
 # Single-bookmark lookups only — includes full_content (which, for anything
-# synced after the storage redesign, is just the original short tweet text;
-# use get_full_content for the actual enriched article).
+# synced after the storage redesign, just mirrors post_text — the real
+# enriched content lives in summary, or use get_full_content for a live
+# re-derivation).
 BOOKMARK_FIELDS = (
     "tweet_id, author_username, author_name, category, summary, full_content, "
-    "tweet_url, bookmarked_at, content_source, image_processing_status, tags"
+    "tweet_url, bookmarked_at, content_source, image_processing_status, tags, "
+    "post_text, quoted_from_tweet_id"
 )
 
 # Multi-result tools — deliberately excludes full_content. Some rows still
@@ -21,7 +23,8 @@ BOOKMARK_FIELDS = (
 # job that full_content used to.
 LIST_FIELDS = (
     "tweet_id, author_username, author_name, category, summary, "
-    "tweet_url, bookmarked_at, content_source, image_processing_status, tags"
+    "tweet_url, bookmarked_at, content_source, image_processing_status, tags, "
+    "post_text, quoted_from_tweet_id"
 )
 
 
@@ -198,13 +201,23 @@ def trigger_sync() -> dict:
             log_sync(0, "success", None, db_path)
             return {"status": "ok", "new_bookmarks": 0, "message": "No new bookmarks found"}
 
+        # Rows with a real content_for_summary need the LLM; rows already
+        # resolved deterministically (nothing substantial anywhere) skip it
+        # entirely — see resolve_bookmark_rows / RESERVED_THIN_CONTENT_CATEGORY.
+        needs_categorization = [t for t in new_tweets if "category" not in t]
+        already_resolved = [t for t in new_tweets if "category" in t]
+
         existing_cats = get_categories(db_path)
         known_tags = get_all_tags(db_path)
-        categorized = categorize_bookmarks(new_tweets, existing_categories=existing_cats, known_tags=known_tags)
-        count = insert_bookmarks(categorized, db_path)
+        categorized = (
+            categorize_bookmarks(needs_categorization, existing_categories=existing_cats, known_tags=known_tags)
+            if needs_categorization else []
+        )
+        all_final = categorized + already_resolved
+        count = insert_bookmarks(all_final, db_path)
         log_sync(count, "success", None, db_path)
 
-        categories_used = list({b["category"] for b in categorized})
+        categories_used = list({b["category"] for b in all_final})
         return {"status": "ok", "new_bookmarks": count, "categories_used": categories_used}
     except Exception as e:
         log_sync(0, "error", str(e), db_path)

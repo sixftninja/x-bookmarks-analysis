@@ -15,15 +15,16 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     author_name TEXT,
     category TEXT NOT NULL,
     summary TEXT NOT NULL,
-    full_content TEXT NOT NULL,
+    full_content TEXT,
     media_urls TEXT,
     tweet_url TEXT,
     bookmarked_at TEXT,
     categorized_at TEXT DEFAULT (datetime('now')),
     content_source TEXT,
     image_processing_status TEXT,
-    quoted_tweet_id TEXT,
-    tags TEXT
+    quoted_from_tweet_id TEXT,
+    tags TEXT,
+    post_text TEXT
 );
 """
 
@@ -33,8 +34,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 _ADDED_COLUMNS = [
     ("content_source", "TEXT"),
     ("image_processing_status", "TEXT"),
-    ("quoted_tweet_id", "TEXT"),
+    ("quoted_from_tweet_id", "TEXT"),
     ("tags", "TEXT"),  # JSON array of strings, e.g. '["Open Source", "Cloud Hosting & Inference Costs"]'
+    ("post_text", "TEXT"),  # verbatim short (<=120 word) post text; NULL when the row's own summary covers it instead
 ]
 
 CREATE_SYNC_LOG = """
@@ -66,9 +68,35 @@ CREATE_INDEXES = [
 
 def _migrate_bookmarks_columns(conn):
     existing = {row[1] for row in conn.execute("PRAGMA table_info(bookmarks)")}
+
+    # quoted_tweet_id (forward pointer: "I quote X") is being replaced by
+    # quoted_from_tweet_id (backward pointer: "I was quoted by X", living on
+    # the derived row) — rename in place rather than add a redundant column.
+    if "quoted_tweet_id" in existing and "quoted_from_tweet_id" not in existing:
+        conn.execute("ALTER TABLE bookmarks RENAME COLUMN quoted_tweet_id TO quoted_from_tweet_id")
+        existing.discard("quoted_tweet_id")
+        existing.add("quoted_from_tweet_id")
+
     for name, col_type in _ADDED_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE bookmarks ADD COLUMN {name} {col_type}")
+
+
+def _migrate_full_content_nullable(conn):
+    """full_content used to be NOT NULL (it always held the enriched article
+    text). Under the current design it's just a mirror of post_text and is
+    frequently absent, so it needs to be nullable — but SQLite has no ALTER
+    COLUMN, so dropping the constraint means rebuilding the table."""
+    info = conn.execute("PRAGMA table_info(bookmarks)").fetchall()
+    full_content_col = next((row for row in info if row[1] == "full_content"), None)
+    if full_content_col is None or full_content_col[3] == 0:
+        return  # already nullable (or, on a brand-new DB, CREATE_BOOKMARKS already has it right)
+
+    cols = ", ".join(row[1] for row in info)
+    conn.execute("ALTER TABLE bookmarks RENAME TO bookmarks_old")
+    conn.execute(CREATE_BOOKMARKS)
+    conn.execute(f"INSERT INTO bookmarks ({cols}) SELECT {cols} FROM bookmarks_old")
+    conn.execute("DROP TABLE bookmarks_old")
 
 
 def init_db(db_path=DEFAULT_DB):
@@ -77,6 +105,7 @@ def init_db(db_path=DEFAULT_DB):
         conn.execute(CREATE_SYNC_LOG)
         conn.execute(CREATE_OAUTH_TOKENS)
         _migrate_bookmarks_columns(conn)
+        _migrate_full_content_nullable(conn)
         for idx in CREATE_INDEXES:
             conn.execute(idx)
         conn.commit()
@@ -89,17 +118,18 @@ def insert_bookmarks(bookmarks, db_path=DEFAULT_DB):
         INSERT OR IGNORE INTO bookmarks
             (tweet_id, author_username, author_name, category, summary,
              full_content, media_urls, tweet_url, bookmarked_at,
-             content_source, image_processing_status, quoted_tweet_id, tags)
+             content_source, image_processing_status, quoted_from_tweet_id, tags, post_text)
         VALUES
             (:tweet_id, :author_username, :author_name, :category, :summary,
              :full_content, :media_urls, :tweet_url, :bookmarked_at,
-             :content_source, :image_processing_status, :quoted_tweet_id, :tags)
+             :content_source, :image_processing_status, :quoted_from_tweet_id, :tags, :post_text)
     """
     defaults = {
         "content_source": "api_text",
         "image_processing_status": "no_images_found",
-        "quoted_tweet_id": None,
+        "quoted_from_tweet_id": None,
         "tags": "[]",
+        "post_text": None,
     }
     rows = [{**defaults, **b} for b in bookmarks]
     with sqlite3.connect(db_path) as conn:

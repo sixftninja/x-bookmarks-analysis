@@ -35,18 +35,28 @@ async def _run_pipeline():
         await loop.run_in_executor(None, log_sync, 0, "success", None, db_path)
         return {"status": "ok", "new_bookmarks": 0, "message": "No new bookmarks found"}
 
+    # Rows with a real content_for_summary need the LLM; rows already
+    # resolved deterministically (nothing substantial anywhere) skip it
+    # entirely — see resolve_bookmark_rows / RESERVED_THIN_CONTENT_CATEGORY.
+    needs_categorization = [t for t in new_tweets if "category" not in t]
+    already_resolved = [t for t in new_tweets if "category" in t]
+
     existing_cats = await loop.run_in_executor(None, get_categories, db_path)
     known_tags = await loop.run_in_executor(None, get_all_tags, db_path)
-    categorized = await loop.run_in_executor(
-        None, lambda: categorize_bookmarks(new_tweets, existing_categories=existing_cats, known_tags=known_tags)
+    categorized = (
+        await loop.run_in_executor(
+            None, lambda: categorize_bookmarks(needs_categorization, existing_categories=existing_cats, known_tags=known_tags)
+        )
+        if needs_categorization else []
     )
+    all_final = categorized + already_resolved
 
     count = await loop.run_in_executor(
-        None, lambda: insert_bookmarks(categorized, db_path)
+        None, lambda: insert_bookmarks(all_final, db_path)
     )
     await loop.run_in_executor(None, log_sync, count, "success", None, db_path)
 
-    categories_used = list({b["category"] for b in categorized})
+    categories_used = list({b["category"] for b in all_final})
     return {"status": "ok", "new_bookmarks": count, "categories_used": categories_used}
 
 

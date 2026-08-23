@@ -8,12 +8,16 @@ import trafilatura
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from app.pipeline.auth import get_valid_access_token
+from app.pipeline.categorize import RESERVED_FALLBACK_TAG, RESERVED_THIN_CONTENT_CATEGORY
 
 load_dotenv()
 
 BASE_URL = "https://api.x.com/2"
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+WORD_COUNT_THRESHOLD = 120  # post text at/under this is a pointer, not the real content — see resolve_bookmark_rows
+MAX_QUOTE_DEPTH = 3  # OP -> QP -> QQP; anything QQP itself quotes is skipped
+_URL_RE = re.compile(r"https?://\S+")
 ARTICLE_HREF_RE = re.compile(r"^/i/article/\d+")
 BARE_LINK_RE = re.compile(r"^https://t\.co/\w+$")
 BARE_URL_ONLY_RE = re.compile(r"^(https?://|www\.)?[\w.-]+\.[a-z]{2,}(/\S*)?$", re.IGNORECASE)
@@ -597,6 +601,168 @@ def backfill_missing_images(author_username, tweet_id, existing_full_content):
     return new_content, image_status
 
 
+# ---------------------------------------------------------------------------
+# Sync-time content resolution: decides, per tweet (recursively for anything
+# it quotes), whether its own text is substantial enough to summarize
+# directly, or whether it's just a pointer to the real content — a linked
+# X article, a linked PDF, or (not yet built) an arbitrary external site.
+# A quoted tweet is never merged into its quoter's text — it becomes its own
+# row, up to 3 levels deep (OP -> QP -> QQP). Images are never touched here;
+# that's exclusively get_full_content's job, on demand.
+# ---------------------------------------------------------------------------
+
+def _extract_first_url(text):
+    """Finds the first whitespace-delimited token that's a URL — reuses
+    is_bare_url_only per-token rather than a fresh regex, since that's
+    already validated safe against both scheme (https://...) and schemeless
+    (arxiv.org/pdf/...) links without false-positiving on ordinary prose."""
+    for token in (text or "").split():
+        candidate = token.rstrip(").,;!?\"'")
+        if is_bare_url_only(candidate):
+            return candidate
+    return None
+
+
+def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=MAX_QUOTE_DEPTH):
+    """Fetches this tweet's own status page and resolves it. Returns None if
+    unreachable (deleted, protected, etc) — caller decides what to do about
+    that (the top-level bookmark falls back to bare API text; a quoted
+    tweet found unreachable is simply dropped, no row for it).
+
+    Returns a dict: tweet_id, author_username, post_text (the verbatim short
+    text, set only when word count is at/under WORD_COUNT_THRESHOLD),
+    content_for_summary (the real content to summarize — None means nothing
+    substantial was found anywhere), and quoted_child (a nested dict of the
+    same shape for whatever this tweet quotes, or None)."""
+    tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
+    try:
+        resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Fetch failed for {tweet_url}: {e}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    primary_block = soup.find("article", attrs={"data-tweet-id": tweet_id})
+    if primary_block is None:
+        return None
+
+    quoted_block = primary_block.find("article", attrs={"data-tweet-id": True})
+    quoted_id = quoted_block.get("data-tweet-id") if quoted_block else None
+
+    handle = _extract_handle(primary_block)
+    html_own_text = _strip_chrome(_own_text(primary_block, exclude_id=quoted_id), handle)
+
+    if len(html_own_text) > ARTICLE_LEN_THRESHOLD:
+        # X inlined a full article body directly into this tweet's own
+        # status page — this is exactly the original bug this whole
+        # pipeline was built to catch: the bookmarks API's own text field
+        # (api_text) only ever gives a bare teaser link for these, never
+        # the real body. Must check this BEFORE preferring api_text, not
+        # after, or that whole class of post silently regresses.
+        own_text = html_own_text
+    elif api_text:
+        # Ordinary tweet — api_text is only ever given for the top-level
+        # bookmarked tweet (OP), and it's cleaner than HTML-derived text
+        # (no chrome-strip residue risk). Quoted tweets (QP/QQP) have no
+        # API text of their own; always chrome-stripped HTML in that case.
+        own_text = api_text
+    else:
+        own_text = html_own_text
+
+    word_count = len(own_text.split())
+
+    if word_count > WORD_COUNT_THRESHOLD:
+        post_text = None
+        content_for_summary = own_text
+    else:
+        post_text = own_text
+        content_for_summary = None
+
+        url = _extract_first_url(own_text)
+        if url:
+            if not url.startswith("http"):
+                url = f"https://{url}"
+            pdf_bytes = _fetch_pdf_bytes_if_pdf(url)
+            if pdf_bytes:
+                try:
+                    pdf_text = _extract_pdf_text(pdf_bytes)
+                    if pdf_text.strip():
+                        content_for_summary = _classify_and_extract_abstract(pdf_text)
+                except Exception as e:
+                    print(f"PDF handling failed for {url}: {e}")
+            # else: url isn't a PDF. Arbitrary external-site scraping (a
+            # plain blog post, GitHub README, etc) is a known TODO, not yet
+            # built — content_for_summary stays None (-> not_enough_content)
+            # for a thin post whose only substance is a non-PDF external link.
+
+    quoted_child = None
+    if quoted_block is not None and depth < max_depth:
+        quoted_handle = _extract_handle(quoted_block)
+        if quoted_handle:
+            quoted_child = _resolve_tweet(quoted_id, quoted_handle, depth=depth + 1, max_depth=max_depth)
+            # quoted_child is None if that tweet's own status page is
+            # unreachable — dropped silently, no row for it, per design.
+
+    return {
+        "tweet_id": tweet_id,
+        "author_username": author_username,
+        "post_text": post_text,
+        "content_for_summary": content_for_summary,
+        "quoted_child": quoted_child,
+    }
+
+
+def _flatten_resolved_tree(resolved, quoted_from=None):
+    """Turns the nested quoted_child structure into a flat list of row
+    dicts, each carrying quoted_from_tweet_id pointing at whichever row
+    quoted it (None for the top-level bookmark itself)."""
+    row = {
+        "tweet_id": resolved["tweet_id"],
+        "author_username": resolved["author_username"],
+        "post_text": resolved["post_text"],
+        "content_for_summary": resolved["content_for_summary"],
+        "quoted_from_tweet_id": quoted_from,
+    }
+    rows = [row]
+    if resolved.get("quoted_child"):
+        rows.extend(_flatten_resolved_tree(resolved["quoted_child"], quoted_from=resolved["tweet_id"]))
+    return rows
+
+
+def resolve_bookmark_rows(tweet_id, author_username, api_text):
+    """Top-level entry point used by fetch_bookmarks(): resolves a newly
+    bookmarked tweet — and, recursively, anything it quotes up to
+    MAX_QUOTE_DEPTH — into a flat list of row-ready dicts. The bookmarked
+    tweet itself (OP) is always the first entry, even if its own status
+    page turns out to be unreachable (falls back to the bare API text
+    rather than being dropped); any quoted tweet found unreachable is
+    simply absent from the list, not present as a broken row."""
+    resolved = None
+    if author_username:
+        try:
+            resolved = _resolve_tweet(tweet_id, author_username, api_text=api_text)
+        except Exception as e:
+            print(f"HTML resolution failed for {tweet_id}: {e}")
+
+    if resolved is None:
+        api_text = api_text or ""
+        word_count = len(api_text.split())
+        if word_count > WORD_COUNT_THRESHOLD:
+            post_text, content_for_summary = None, api_text
+        else:
+            post_text, content_for_summary = api_text, None
+        resolved = {
+            "tweet_id": tweet_id,
+            "author_username": author_username,
+            "post_text": post_text,
+            "content_for_summary": content_for_summary,
+            "quoted_child": None,
+        }
+
+    return _flatten_resolved_tree(resolved)
+
+
 def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
     if db_path is None:
         db_path = os.getenv("DATABASE_URL", "./bookmarks.db")
@@ -646,35 +812,54 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
             author_username = author.get("username")
             raw_text = tweet.get("text", "")
 
-            # Enriched text (article scrape, quote-tweet merge — no images,
-            # that's on-demand only) is used ONLY to write a good summary
-            # below; it's never stored. full_content stays the original,
-            # cheap API text — see the "don't store the article" decision.
-            content_for_summary, content_source, image_processing_status, quoted_tweet_id = enrich_tweet_content(
-                raw_text, author_username, tweet_id, describe_images=False
-            )
+            # A single bookmarked tweet can resolve to several rows: itself,
+            # plus anything it quotes (up to MAX_QUOTE_DEPTH), each a fully
+            # independent bookmark with its own summary/category/tags.
+            for row in resolve_bookmark_rows(tweet_id, author_username, raw_text):
+                is_op = row["tweet_id"] == tweet_id
+                row_author = row["author_username"]
+                content_for_summary = row["content_for_summary"]
 
-            page_results.append(
-                {
-                    "tweet_id": tweet_id,
-                    "author_username": author_username,
-                    "author_name": author.get("name"),
-                    "full_content": raw_text,
-                    "content_for_summary": content_for_summary,
-                    "content_source": content_source,
-                    "image_processing_status": image_processing_status,
-                    "quoted_tweet_id": quoted_tweet_id,
-                    "media_urls": _extract_media_urls(tweet.get("entities")),
+                bookmark = {
+                    "tweet_id": row["tweet_id"],
+                    "author_username": row_author,
+                    "author_name": author.get("name") if is_op else None,
+                    "post_text": row["post_text"],
+                    "full_content": row["post_text"],
+                    "quoted_from_tweet_id": row["quoted_from_tweet_id"],
+                    "media_urls": _extract_media_urls(tweet.get("entities")) if is_op else None,
                     "tweet_url": (
-                        f"https://x.com/{author_username}/status/{tweet_id}"
-                        if author_username
-                        else None
+                        f"https://x.com/{row_author}/status/{row['tweet_id']}"
+                        if row_author else None
                     ),
-                    "bookmarked_at": tweet.get("created_at"),
+                    "bookmarked_at": tweet.get("created_at") if is_op else None,
                 }
-            )
 
-        new_in_page = [t for t in page_results if t["tweet_id"] not in existing_tweet_ids]
+                if content_for_summary is None:
+                    # Nothing substantial anywhere for this row — decided
+                    # deterministically (word count), so skip the LLM call
+                    # entirely rather than asking it to summarize nothing.
+                    bookmark["category"] = RESERVED_THIN_CONTENT_CATEGORY
+                    bookmark["summary"] = "not_enough_content"
+                    bookmark["tags"] = json.dumps([RESERVED_FALLBACK_TAG])
+                else:
+                    # category/summary/tags deliberately absent — the
+                    # caller runs this through categorize_bookmarks() next.
+                    bookmark["content_for_summary"] = content_for_summary
+
+                page_results.append(bookmark)
+
+        # Dedupe within this run: the same tweet can surface twice (e.g. two
+        # different OPs quoting the same post in this page, or in an
+        # earlier one). DB-level INSERT OR IGNORE would catch it either
+        # way, but this avoids wasting an LLM call summarizing it twice.
+        seen_in_run = {r["tweet_id"] for r in results}
+        new_in_page = []
+        for t in page_results:
+            if t["tweet_id"] in existing_tweet_ids or t["tweet_id"] in seen_in_run:
+                continue
+            seen_in_run.add(t["tweet_id"])
+            new_in_page.append(t)
         results.extend(new_in_page)
 
         print(f"Fetched page {page} ({len(results)} new bookmarks so far)...")
