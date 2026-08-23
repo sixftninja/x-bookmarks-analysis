@@ -27,6 +27,10 @@ ARTICLE_HREF_RE = re.compile(r"^/i/article/\d+")
 BARE_LINK_RE = re.compile(r"^https://t\.co/\w+$")
 BARE_URL_ONLY_RE = re.compile(r"^(https?://|www\.)?[\w.-]+\.[a-z]{2,}(/\S*)?$", re.IGNORECASE)
 HANDLE_HREF_RE = re.compile(r"^/([A-Za-z0-9_]{1,15})$")
+# A quote-tweet's own permalink/date anchor, e.g. href="/staysaasy/status/2042063369432183238"
+# — the only place its tweet_id is still exposed since X dropped the
+# data-tweet-id attribute (see _extract_quoted_identity).
+STATUS_HREF_RE = re.compile(r"^/([A-Za-z0-9_]{1,15})/status/(\d+)")
 ARTICLE_LEN_THRESHOLD = 1500  # chars — signals a tweet's own status page already inlines a full article body
 
 # Chrome around a tweet block's own text (author name/handle header, date,
@@ -79,27 +83,41 @@ def _extract_media_urls(entities):
 # ---------------------------------------------------------------------------
 # Plain-HTTP status-page parsing (primary path — validated against real
 # tweets: reaches x.com fine without OAuth, article bodies come inlined into
-# a tweet's own status page, and quote-tweets are a nested
-# <article data-tweet-id> element inside the primary tweet's own block).
+# a tweet's own status page, and a quote-tweet is a nested <article> element
+# inside the primary tweet's own block. X identifies the primary tweet via
+# itemid="https://x.com/i/status/<id>" on its own <article> — the nested
+# quote-tweet <article> carries no such id at all, so its identity has to be
+# read off its own permalink/date anchor instead (see
+# _extract_quoted_identity). Any <article> found via block.find("article")
+# — i.e. scoped to block's own descendants, which correctly excludes block
+# itself — is unambiguously a nested quote, never an unrelated reply or
+# "more from this author" block; those render as page-level siblings, not
+# nested inside the primary tweet's own subtree.
 # ---------------------------------------------------------------------------
 
-def _own_text(block, exclude_id=None):
-    """get_text() of a block with any nested quote-tweet subtree stripped out."""
+def _own_text(block):
+    """get_text() of a block with any nested quote-tweet subtree stripped out.
+    Operates on an independent re-parsed copy so the caller's own tree
+    (block, and whatever it's nested inside) is untouched."""
     copy = BeautifulSoup(str(block), "lxml")
-    if exclude_id:
-        nested = copy.find("article", attrs={"data-tweet-id": exclude_id})
-        if nested:
-            nested.decompose()
-    return copy.get_text(separator="\n", strip=True)
+    root = copy.find("article")
+    if root is None:
+        return copy.get_text(separator="\n", strip=True)
+    nested = root.find("article")
+    if nested:
+        nested.decompose()
+    return root.get_text(separator="\n", strip=True)
 
 
-def _find_article_href(block, exclude_id=None):
+def _find_article_href(block):
     copy = BeautifulSoup(str(block), "lxml")
-    if exclude_id:
-        nested = copy.find("article", attrs={"data-tweet-id": exclude_id})
-        if nested:
-            nested.decompose()
-    a = copy.find("a", href=ARTICLE_HREF_RE)
+    root = copy.find("article")
+    if root is None:
+        return None
+    nested = root.find("article")
+    if nested:
+        nested.decompose()
+    a = root.find("a", href=ARTICLE_HREF_RE)
     return a.get("href") if a else None
 
 
@@ -109,6 +127,54 @@ def _extract_handle(block):
         if m:
             return m.group(1)
     return None
+
+
+def _extract_quoted_identity(quoted_block):
+    """Returns (handle, tweet_id) for a nested quote-tweet block, read off
+    its own permalink/date anchor — X no longer exposes a stable id
+    attribute on nested articles, so this anchor is the only remaining
+    source for either value. Returns (None, None) if not found."""
+    a = quoted_block.find("a", href=STATUS_HREF_RE)
+    if not a:
+        return None, None
+    m = STATUS_HREF_RE.match(a["href"])
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+_X_DOMAIN_PREFIXES = ("https://x.com", "http://x.com", "https://twitter.com", "http://twitter.com")
+
+
+def _is_internal_x_href(href):
+    """True for hrefs that stay within x.com/twitter.com itself — profile
+    links, status permalinks, hashtags — never a link the post is actually
+    pointing readers to."""
+    return href.startswith("/") or href.startswith(_X_DOMAIN_PREFIXES)
+
+
+def _extract_first_href(block):
+    """Finds the first real external link's href within a block's own
+    subtree (nested quote-tweet content excluded) — reads actual anchor
+    hrefs rather than the block's flattened display text, since X visually
+    truncates long URLs in tweet text with an ellipsis while the href
+    itself always carries the real, untruncated URL. Prefers an expanded
+    href over its t.co redirect wrapper when both are present for the same
+    link (X commonly renders both), since the expanded one saves a
+    redirect hop. Returns None if block has no matching anchor at all —
+    callers should fall back to text-based extraction in that case."""
+    copy = BeautifulSoup(str(block), "lxml")
+    root = copy.find("article")
+    if root is None:
+        return None
+    nested = root.find("article")
+    if nested:
+        nested.decompose()
+
+    candidates = [
+        a["href"] for a in root.find_all("a", href=True)
+        if a["href"].startswith("http") and not _is_internal_x_href(a["href"])
+    ]
+    non_tco = [h for h in candidates if "t.co/" not in h]
+    return (non_tco or candidates or [None])[0]
 
 
 def _strip_chrome(text, handle):
@@ -283,12 +349,15 @@ def _resolve_external_link(url):
     return _fetch_article_text_trafilatura(url)
 
 
-def _finalize_short_text(text):
+def _finalize_short_text(text, block=None):
     """For short (non-article) block text: look for a URL anywhere in it —
     not just when the block is nothing else — and try to resolve what it
     points to (a PDF's abstract, or a generic external article) rather than
-    leaving a link as dead text."""
-    url = _extract_first_url(text)
+    leaving a link as dead text. Prefers reading the real href straight off
+    block's own anchors (untruncated) over scanning text, when block is
+    given — falls back to text-scanning otherwise (or if the block has no
+    matching anchor)."""
+    url = (_extract_first_href(block) if block is not None else None) or _extract_first_url(text)
     if not url:
         return {"text": text, "scraped": False}
 
@@ -302,15 +371,15 @@ def _finalize_short_text(text):
     return {"text": f"{text}\n\n---\nLinked content:\n{resolved}", "scraped": True}
 
 
-def _process_block(block, exclude_id, clean_text_fallback=None):
+def _process_block(block, clean_text_fallback=None):
     """Returns {"text", "scraped"} for one tweet block (primary or quoted).
     Follows an /i/article/ link if present; otherwise, for the common case
     (no article, no quote) prefers clean_text_fallback — the original API
     tweet text — over the HTML block's own get_text(), which carries
     name/handle/stat chrome that needs stripping. Only the primary tweet has
     API text available; quoted tweets always go through chrome-stripping."""
-    raw_text = _own_text(block, exclude_id=exclude_id)
-    article_href = _find_article_href(block, exclude_id=exclude_id)
+    raw_text = _own_text(block)
+    article_href = _find_article_href(block)
 
     if article_href:
         article_url = f"https://x.com{article_href}"
@@ -327,10 +396,10 @@ def _process_block(block, exclude_id, clean_text_fallback=None):
         return {"text": _strip_chrome(raw_text, handle), "scraped": True}
 
     if clean_text_fallback:
-        return _finalize_short_text(clean_text_fallback)
+        return _finalize_short_text(clean_text_fallback, block=block)
 
     handle = _extract_handle(block)
-    return _finalize_short_text(_strip_chrome(raw_text, handle))
+    return _finalize_short_text(_strip_chrome(raw_text, handle), block=block)
 
 
 # ---------------------------------------------------------------------------
@@ -345,21 +414,20 @@ def _enrich_via_html(tweet_url, tweet_id, api_text):
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
 
-    primary_block = soup.find("article", attrs={"data-tweet-id": tweet_id})
+    primary_block = soup.find("article", attrs={"itemid": f"https://x.com/i/status/{tweet_id}"})
     if primary_block is None:
         return None
 
-    quoted_block = primary_block.find("article", attrs={"data-tweet-id": True})
-    quoted_id = quoted_block.get("data-tweet-id") if quoted_block else None
+    quoted_block = primary_block.find("article")
+    quoted_handle, quoted_id = _extract_quoted_identity(quoted_block) if quoted_block else (None, None)
 
-    primary = _process_block(primary_block, exclude_id=quoted_id, clean_text_fallback=api_text)
+    primary = _process_block(primary_block, clean_text_fallback=api_text)
     full_content = primary["text"]
     scraped_any = primary["scraped"]
 
     if quoted_block is not None:
-        quoted = _process_block(quoted_block, exclude_id=None)
-        handle = _extract_handle(quoted_block)
-        quoted_label = f"@{handle}" if handle else "the quoted tweet"
+        quoted = _process_block(quoted_block)
+        quoted_label = f"@{quoted_handle}" if quoted_handle else "the quoted tweet"
         full_content = f"{full_content}\n\n---\nQuoted {quoted_label}:\n{quoted['text']}"
         scraped_any = scraped_any or quoted["scraped"]
 
@@ -450,15 +518,15 @@ def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
-    primary_block = soup.find("article", attrs={"data-tweet-id": tweet_id})
+    primary_block = soup.find("article", attrs={"itemid": f"https://x.com/i/status/{tweet_id}"})
     if primary_block is None:
         return None
 
-    quoted_block = primary_block.find("article", attrs={"data-tweet-id": True})
-    quoted_id = quoted_block.get("data-tweet-id") if quoted_block else None
+    quoted_block = primary_block.find("article")
+    quoted_handle, quoted_id = _extract_quoted_identity(quoted_block) if quoted_block else (None, None)
 
     handle = _extract_handle(primary_block)
-    html_own_text = _strip_chrome(_own_text(primary_block, exclude_id=quoted_id), handle)
+    html_own_text = _strip_chrome(_own_text(primary_block), handle)
 
     if len(html_own_text) > ARTICLE_LEN_THRESHOLD:
         # X inlined a full article body directly into this tweet's own
@@ -481,10 +549,12 @@ def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=
 
     # A link is chased for every post, regardless of its own length — a
     # 250-word post with a link at the end still deserves the linked
-    # content folded into its summary, not just its own words.
+    # content folded into its summary, not just its own words. Prefer the
+    # real href straight off the page's own anchors (untruncated) over
+    # scanning own_text, which may be X's visually-truncated display text.
     external_text = None
     external_word_count = 0
-    url = _extract_first_url(own_text)
+    url = _extract_first_href(primary_block) or _extract_first_url(own_text)
     if url:
         normalized_url = url if url.startswith("http") else f"https://{url}"
         try:
@@ -525,12 +595,10 @@ def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=
         force_summary_sentinel = False
 
     quoted_child = None
-    if quoted_block is not None and depth < max_depth:
-        quoted_handle = _extract_handle(quoted_block)
-        if quoted_handle:
-            quoted_child = _resolve_tweet(quoted_id, quoted_handle, depth=depth + 1, max_depth=max_depth)
-            # quoted_child is None if that tweet's own status page is
-            # unreachable — dropped silently, no row for it, per design.
+    if quoted_block is not None and depth < max_depth and quoted_handle and quoted_id:
+        quoted_child = _resolve_tweet(quoted_id, quoted_handle, depth=depth + 1, max_depth=max_depth)
+        # quoted_child is None if that tweet's own status page is
+        # unreachable — dropped silently, no row for it, per design.
 
     return {
         "tweet_id": tweet_id,
@@ -597,6 +665,55 @@ def resolve_bookmark_rows(tweet_id, author_username, api_text):
     return _flatten_resolved_tree(resolved)
 
 
+def build_bookmark_dict(row, is_op, author_name=None, media_urls=None, bookmarked_at=None):
+    """Turns one resolve_bookmark_rows() row into an insert/update-ready
+    bookmark dict — category/summary/tags either filled in deterministically
+    (nothing substantial anywhere for this row) or left absent for the
+    caller to run through categorize_bookmarks() next.
+
+    author_name/media_urls/bookmarked_at only ever apply to the OP (a
+    derived quote row has none of these — same as fetch_bookmarks() already
+    treats them for a freshly-discovered QP/QQP, since a quote row was never
+    itself returned by the bookmarks API). Shared by fetch_bookmarks() (has
+    these live from the API response for the OP) and the one-time backfill
+    script (re-processing existing rows, which already has these values
+    stored from the row's original sync and passes none in here — it
+    updates them separately, or not at all, rather than through this dict)."""
+    row_author = row["author_username"]
+    content_for_summary = row["content_for_summary"]
+
+    bookmark = {
+        "tweet_id": row["tweet_id"],
+        "author_username": row_author,
+        "author_name": author_name if is_op else None,
+        "post_text": row["post_text"],
+        "full_content": row["post_text"],
+        "quoted_from_tweet_id": row["quoted_from_tweet_id"],
+        "media_urls": media_urls if is_op else None,
+        "tweet_url": (
+            f"https://x.com/{row_author}/status/{row['tweet_id']}"
+            if row_author else None
+        ),
+        "bookmarked_at": bookmarked_at if is_op else None,
+    }
+
+    if content_for_summary is None:
+        # Nothing substantial anywhere for this row — decided
+        # deterministically (word count), so skip the LLM call entirely
+        # rather than asking it to summarize nothing.
+        bookmark["category"] = NOT_ENOUGH_CONTENT_CATEGORY
+        bookmark["summary"] = NOT_ENOUGH_CONTENT_SUMMARY
+        bookmark["tags"] = json.dumps([NOT_ENOUGH_CONTENT_TAG])
+    else:
+        # category/summary/tags deliberately absent — the caller runs this
+        # through categorize_bookmarks() next.
+        bookmark["content_for_summary"] = content_for_summary
+        if row["force_summary_sentinel"]:
+            bookmark["_force_summary_sentinel"] = True
+
+    return bookmark
+
+
 def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
     if db_path is None:
         db_path = os.getenv("DATABASE_URL", "./bookmarks.db")
@@ -651,38 +768,12 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
             # independent bookmark with its own summary/category/tags.
             for row in resolve_bookmark_rows(tweet_id, author_username, raw_text):
                 is_op = row["tweet_id"] == tweet_id
-                row_author = row["author_username"]
-                content_for_summary = row["content_for_summary"]
-
-                bookmark = {
-                    "tweet_id": row["tweet_id"],
-                    "author_username": row_author,
-                    "author_name": author.get("name") if is_op else None,
-                    "post_text": row["post_text"],
-                    "full_content": row["post_text"],
-                    "quoted_from_tweet_id": row["quoted_from_tweet_id"],
-                    "media_urls": _extract_media_urls(tweet.get("entities")) if is_op else None,
-                    "tweet_url": (
-                        f"https://x.com/{row_author}/status/{row['tweet_id']}"
-                        if row_author else None
-                    ),
-                    "bookmarked_at": tweet.get("created_at") if is_op else None,
-                }
-
-                if content_for_summary is None:
-                    # Nothing substantial anywhere for this row — decided
-                    # deterministically (word count), so skip the LLM call
-                    # entirely rather than asking it to summarize nothing.
-                    bookmark["category"] = NOT_ENOUGH_CONTENT_CATEGORY
-                    bookmark["summary"] = NOT_ENOUGH_CONTENT_SUMMARY
-                    bookmark["tags"] = json.dumps([NOT_ENOUGH_CONTENT_TAG])
-                else:
-                    # category/summary/tags deliberately absent — the
-                    # caller runs this through categorize_bookmarks() next.
-                    bookmark["content_for_summary"] = content_for_summary
-                    if row["force_summary_sentinel"]:
-                        bookmark["_force_summary_sentinel"] = True
-
+                bookmark = build_bookmark_dict(
+                    row, is_op,
+                    author_name=author.get("name"),
+                    media_urls=_extract_media_urls(tweet.get("entities")),
+                    bookmarked_at=tweet.get("created_at"),
+                )
                 page_results.append(bookmark)
 
         # Dedupe within this run: the same tweet can surface twice (e.g. two
