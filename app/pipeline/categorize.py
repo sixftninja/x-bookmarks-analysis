@@ -6,9 +6,10 @@ BATCH_SIZE = 25
 
 # Fixed tag vocabulary. Unlike categories (still free-form), tags are never
 # invented mid-run — the model must pick from this list (plus whatever's
-# already been used on real bookmarks, passed in as known_tags) or fall back
-# to RESERVED_FALLBACK_TAG. New tags only ever get added deliberately, via
-# the add_tag_to_bookmark MCP tool after a human approves one.
+# already been used on real bookmarks, passed in as known_tags) or leave
+# tags empty if none genuinely fit (e.g. the post isn't about AI at all).
+# New tags only ever get added deliberately, via the add_tag_to_bookmark MCP
+# tool after a human approves one.
 SEED_TAGS = [
     "Model Capabilities",
     "Model Releases",
@@ -42,17 +43,24 @@ SEED_TAGS = [
     "Personal Content",
 ]
 
-RESERVED_FALLBACK_TAG = "Uncategorized"
-
 # Reserved category for posts whose own text is minimal-to-nonexistent — a
 # short reaction plus a link/image/video attachment, with no real topic to
-# infer even after any image gets described. Distinct from the old
-# "Link-Only Posts" bug category (that one meant BROKEN: content recovery
-# failed entirely). This one means recovery succeeded and the content is
-# just genuinely thin — forcing it into an unrelated topical category
-# (e.g. "Development Tools" for "This is so cool! [link]") was worse than
-# naming what it actually is.
+# infer. Distinct from the old "Link-Only Posts" bug category (that one
+# meant BROKEN: content recovery failed entirely). This one means recovery
+# succeeded and the content is just genuinely thin — forcing it into an
+# unrelated topical category (e.g. "Development Tools" for "This is so
+# cool! [link]") was worse than naming what it actually is. This is an LLM
+# judgment call, made about content it was actually shown — different from
+# the three below.
 RESERVED_THIN_CONTENT_CATEGORY = "Minimal-Content Posts"
+
+# These three are NEVER LLM-selectable — they don't appear in any prompt.
+# fetch.py writes them directly, purely from a word-count check, for a row
+# whose own text (and whatever it points to) doesn't clear the bar to be
+# worth an LLM call at all.
+NOT_ENOUGH_CONTENT_CATEGORY = "not_enough_content_category"
+NOT_ENOUGH_CONTENT_TAG = "not_enough_content_tags"
+NOT_ENOUGH_CONTENT_SUMMARY = "not_enough_content_summary"
 
 BASE_SYSTEM_PROMPT = """You are analyzing a collection of bookmarked posts from X (Twitter). Your job is to:
 1. Identify meaningful, specific categories that reflect the actual content themes
@@ -80,7 +88,7 @@ TAGS_INSTRUCTION = (
     "- A post can and often should have multiple tags when it genuinely spans more than one "
     "(e.g. a post about running an open-source agent harness cheaply on cloud infra is "
     '"Open Source AI", "Cloud Hosting & Inference Costs", AND "Agent Harness & Orchestration" all at once)\n'
-    f'- Only if a post genuinely fits none of the listed tags, use exactly ["{RESERVED_FALLBACK_TAG}"] and nothing else'
+    "- If a post genuinely fits none of the listed tags (e.g. it's not about AI at all), return an empty array for tags"
 )
 
 INCREMENTAL_EXTRA = "\n- You have these existing categories: {categories}. Assign to existing categories where possible. Only create a new category if the content genuinely doesn't fit any existing one."
@@ -96,7 +104,13 @@ def _build_system_prompt(known_categories, tag_vocabulary):
 
 def _merge_batch(batch_results, tweet_map):
     """Turns raw per-item LLM output into final bookmark dicts (original
-    fields + category/summary/tags). Returns (merged_list, skipped_count)."""
+    fields + category/summary/tags). Returns (merged_list, skipped_count).
+
+    original["_force_summary_sentinel"] (set by fetch.py for a row that had
+    enough to categorize but not enough to summarize on its own) means: keep
+    the LLM's category/tags, but discard whatever it wrote for summary and
+    use NOT_ENOUGH_CONTENT_SUMMARY instead — summary is the only field this
+    overrides."""
     merged_list = []
     skipped = 0
     for item in batch_results:
@@ -105,13 +119,18 @@ def _merge_batch(batch_results, tweet_map):
             continue
         original = tweet_map.get(item.get("tweet_id", ""))
         tags = item.get("tags")
-        if not isinstance(tags, list) or not tags:
-            tags = [RESERVED_FALLBACK_TAG]
+        if not isinstance(tags, list):
+            tags = []
         if original and item.get("category") and item.get("summary"):
+            summary = (
+                NOT_ENOUGH_CONTENT_SUMMARY
+                if original.get("_force_summary_sentinel")
+                else item["summary"]
+            )
             merged_list.append({
-                **original,
+                **{k: v for k, v in original.items() if k != "_force_summary_sentinel"},
                 "category": item["category"],
-                "summary": item["summary"],
+                "summary": summary,
                 "tags": json.dumps(tags),
             })
         else:

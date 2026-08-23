@@ -37,7 +37,7 @@ async def _run_pipeline():
 
     # Rows with a real content_for_summary need the LLM; rows already
     # resolved deterministically (nothing substantial anywhere) skip it
-    # entirely — see resolve_bookmark_rows / RESERVED_THIN_CONTENT_CATEGORY.
+    # entirely — see resolve_bookmark_rows / NOT_ENOUGH_CONTENT_CATEGORY.
     needs_categorization = [t for t in new_tweets if "category" not in t]
     already_resolved = [t for t in new_tweets if "category" in t]
 

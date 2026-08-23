@@ -163,7 +163,7 @@ def _backfill_teaser_only_rows(db_path):
         # the bare t.co link (that's what made it a candidate). Passing it
         # through would make enrich_tweet_content() trust and keep that bare
         # link instead of the real content freshly scraped from the page.
-        full, content_source, image_status, quoted_id = enrich_tweet_content(
+        full, content_source, quoted_id = enrich_tweet_content(
             "", author_username, tweet_id
         )
         if content_source == "api_teaser_only":
@@ -174,12 +174,12 @@ def _backfill_teaser_only_rows(db_path):
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """UPDATE bookmarks
-                   SET full_content = ?, content_source = ?, image_processing_status = ?, quoted_from_tweet_id = ?
+                   SET full_content = ?, content_source = ?, quoted_from_tweet_id = ?
                    WHERE tweet_id = ?""",
-                (full, content_source, image_status, quoted_id, tweet_id),
+                (full, content_source, quoted_id, tweet_id),
             )
             conn.commit()
-        print(f"  {tweet_id}: backfilled -> content_source={content_source} image_processing_status={image_status}")
+        print(f"  {tweet_id}: backfilled -> content_source={content_source}")
 
         # Recategorize immediately, not batched at the end: if this crashes
         # partway through, already-backfilled rows are already fully done

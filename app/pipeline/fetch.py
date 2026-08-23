@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 import re
@@ -8,16 +7,22 @@ import trafilatura
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from app.pipeline.auth import get_valid_access_token
-from app.pipeline.categorize import RESERVED_FALLBACK_TAG, RESERVED_THIN_CONTENT_CATEGORY
+from app.pipeline.categorize import (
+    NOT_ENOUGH_CONTENT_CATEGORY,
+    NOT_ENOUGH_CONTENT_TAG,
+    NOT_ENOUGH_CONTENT_SUMMARY,
+)
 
 load_dotenv()
 
 BASE_URL = "https://api.x.com/2"
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-WORD_COUNT_THRESHOLD = 120  # post text at/under this is a pointer, not the real content — see resolve_bookmark_rows
+# A row's own text (and separately, whatever a link in it resolves to) gets
+# classified against these two bars — see resolve_bookmark_rows / _resolve_tweet.
+MIN_CATEGORIZE_WORDS = 40   # below this, with nothing rescuing it: not worth an LLM call at all
+MIN_SUMMARIZE_WORDS = 300   # at/above this: substantial enough to actually compress into a summary
 MAX_QUOTE_DEPTH = 3  # OP -> QP -> QQP; anything QQP itself quotes is skipped
-_URL_RE = re.compile(r"https?://\S+")
 ARTICLE_HREF_RE = re.compile(r"^/i/article/\d+")
 BARE_LINK_RE = re.compile(r"^https://t\.co/\w+$")
 BARE_URL_ONLY_RE = re.compile(r"^(https?://|www\.)?[\w.-]+\.[a-z]{2,}(/\S*)?$", re.IGNORECASE)
@@ -32,9 +37,7 @@ _MONTH_ABBR_RE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)
 _STAT_LINE_RE = re.compile(r"^[\d.,]+[KM]?$")
 _TIME_LINE_RE = re.compile(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*[·\-]")
 
-OPENAI_VISION_MODEL = "gpt-4o"
 OPENAI_TEXT_MODEL = "gpt-4o"
-ANTHROPIC_VISION_MODEL = "claude-sonnet-5"
 ANTHROPIC_TEXT_MODEL = "claude-sonnet-5"
 
 PDF_ABSTRACT_INSTRUCTION = (
@@ -45,16 +48,6 @@ PDF_ABSTRACT_INSTRUCTION = (
     "etc). If it IS a research paper: reply with ONLY the abstract text, "
     "verbatim, nothing else — no preamble, no 'Abstract:' label. If it is "
     "NOT a research paper: reply with exactly the single word NO."
-)
-
-VISION_INSTRUCTION = (
-    "You are continuing a piece of writing at the exact point an image appeared. "
-    "Write 1-3 sentences describing what the image shows, but phrased as if the "
-    "original author is directly describing/narrating it themselves as part of "
-    "their own prose — never use meta-language like 'the image shows', 'this "
-    "picture depicts', 'in this screenshot', etc. Just write the content directly, "
-    "in a plain, matter-of-fact register consistent with tech/startup writing. "
-    "Return only the text to splice in, nothing else."
 )
 
 
@@ -110,20 +103,6 @@ def _find_article_href(block, exclude_id=None):
     return a.get("href") if a else None
 
 
-def _find_content_images(block, exclude_id=None):
-    copy = BeautifulSoup(str(block), "lxml")
-    if exclude_id:
-        nested = copy.find("article", attrs={"data-tweet-id": exclude_id})
-        if nested:
-            nested.decompose()
-    urls = []
-    for img in copy.find_all("img"):
-        src = img.get("src", "")
-        if "pbs.twimg.com/media/" in src and src not in urls:
-            urls.append(src)
-    return urls
-
-
 def _extract_handle(block):
     for a in block.find_all("a", href=True):
         m = HANDLE_HREF_RE.match(a["href"])
@@ -159,8 +138,10 @@ def _strip_chrome(text, handle):
 
 
 def _fetch_article_text_trafilatura(url):
-    """Fallback only — used when the BeautifulSoup article-page parse below
-    comes back empty (page structure changed, etc)."""
+    """General-purpose "download this URL and extract its readable article
+    text" helper — has no idea what site it's looking at. Used both as a
+    fallback when the BeautifulSoup parse of X's own native Article pages
+    comes back empty, and as the main path for any other external site."""
     try:
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
@@ -175,7 +156,7 @@ def _fetch_article_text_trafilatura(url):
 def _scrape_article_page(article_url):
     """Dedicated x.com/i/article/<id> pages use a different template than
     status pages: <article class="mx-auto..."> > <h1> + <div class="x-article-body">.
-    Returns (text, image_urls)."""
+    Returns text, or None."""
     try:
         resp = httpx.get(article_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
         resp.raise_for_status()
@@ -186,18 +167,12 @@ def _scrape_article_page(article_url):
             title = title_el.get_text(strip=True) if title_el else ""
             text = body.get_text(separator="\n", strip=True)
             full_text = f"{title}\n\n{text}".strip() if title else text
-            images = [
-                img.get("src")
-                for img in body.find_all("img")
-                if "pbs.twimg.com/media/" in (img.get("src") or "")
-            ]
             if full_text:
-                return full_text, images
+                return full_text
     except Exception as e:
         print(f"Article page parse failed for {article_url}: {e}")
 
-    text = _fetch_article_text_trafilatura(article_url)
-    return (text, []) if text else (None, [])
+    return _fetch_article_text_trafilatura(article_url)
 
 
 def is_bare_url_only(text):
@@ -279,212 +254,93 @@ def _classify_and_extract_abstract(pdf_text):
     return None if (not text or text.upper() == "NO") else text
 
 
-def _resolve_bare_url_pdf(text):
-    """If text is nothing but a bare URL and that URL serves a PDF, returns
-    replacement text: the paper's abstract if it's a research paper, else an
-    explanatory placeholder. Returns None if text isn't a bare URL, the URL
-    isn't actually a PDF, or extraction fails — callers should keep the
-    original text in that case."""
-    stripped = text.strip()
-    if not is_bare_url_only(stripped):
-        return None
-
-    url = stripped if stripped.startswith("http") else f"https://{stripped}"
+def _resolve_external_link(url):
+    """Given a URL (scheme included), returns its resolved text content, or
+    None if nothing could be extracted. PDFs are checked first: a research
+    paper yields just its abstract, anything else a short explanatory
+    placeholder. Non-PDF links are scraped generically via trafilatura — no
+    attempt to detect a paper's HTML landing page by URL shape; downstream
+    summarization is left to recognize that on its own. Shared by both the
+    sync-time pipeline and the on-demand get_full_content path."""
     pdf_bytes = _fetch_pdf_bytes_if_pdf(url)
-    if not pdf_bytes:
-        return None
+    if pdf_bytes:
+        not_a_paper_message = (
+            f"This link leads to a PDF which doesn't seem to be a research paper, "
+            f"hence only retaining the link: {url}"
+        )
+        try:
+            pdf_text = _extract_pdf_text(pdf_bytes)
+        except Exception as e:
+            print(f"PDF text extraction failed for {url}: {e}")
+            return not_a_paper_message
 
-    not_a_paper_message = (
-        f"This link leads to a PDF which doesn't seem to be a research paper, "
-        f"hence only retaining the link: {url}"
-    )
+        if not pdf_text.strip():
+            return not_a_paper_message
 
-    try:
-        pdf_text = _extract_pdf_text(pdf_bytes)
-    except Exception as e:
-        print(f"PDF text extraction failed for {url}: {e}")
-        return not_a_paper_message
+        abstract = _classify_and_extract_abstract(pdf_text)
+        return abstract if abstract else not_a_paper_message
 
-    if not pdf_text.strip():
-        return not_a_paper_message
-
-    abstract = _classify_and_extract_abstract(pdf_text)
-    return abstract if abstract else not_a_paper_message
+    return _fetch_article_text_trafilatura(url)
 
 
-def _finalize_short_text(text, image_urls):
-    """For short (non-article) block text: if it's literally just a bare
-    URL, try resolving it as a PDF instead of leaving a dead link as the
-    final content."""
-    resolved = _resolve_bare_url_pdf(text)
-    if resolved:
-        return {"text": resolved, "scraped": True, "image_urls": image_urls}
-    return {"text": text, "scraped": False, "image_urls": image_urls}
+def _finalize_short_text(text):
+    """For short (non-article) block text: look for a URL anywhere in it —
+    not just when the block is nothing else — and try to resolve what it
+    points to (a PDF's abstract, or a generic external article) rather than
+    leaving a link as dead text."""
+    url = _extract_first_url(text)
+    if not url:
+        return {"text": text, "scraped": False}
+
+    normalized_url = url if url.startswith("http") else f"https://{url}"
+    resolved = _resolve_external_link(normalized_url)
+    if not resolved:
+        return {"text": text, "scraped": False}
+
+    if is_bare_url_only(text.strip()):
+        return {"text": resolved, "scraped": True}
+    return {"text": f"{text}\n\n---\nLinked content:\n{resolved}", "scraped": True}
 
 
 def _process_block(block, exclude_id, clean_text_fallback=None):
-    """Returns {"text", "scraped", "image_urls"} for one tweet block (primary
-    or quoted). Follows an /i/article/ link if present; otherwise, for the
-    common case (no article, no quote, no images) prefers clean_text_fallback
-    — the original API tweet text — over the HTML block's own get_text(),
-    which carries name/handle/stat chrome that needs stripping. Only the
-    primary tweet has API text available; quoted tweets always go through
-    chrome-stripping."""
+    """Returns {"text", "scraped"} for one tweet block (primary or quoted).
+    Follows an /i/article/ link if present; otherwise, for the common case
+    (no article, no quote) prefers clean_text_fallback — the original API
+    tweet text — over the HTML block's own get_text(), which carries
+    name/handle/stat chrome that needs stripping. Only the primary tweet has
+    API text available; quoted tweets always go through chrome-stripping."""
     raw_text = _own_text(block, exclude_id=exclude_id)
     article_href = _find_article_href(block, exclude_id=exclude_id)
 
     if article_href:
         article_url = f"https://x.com{article_href}"
-        scraped_text, scraped_images = _scrape_article_page(article_url)
+        scraped_text = _scrape_article_page(article_url)
         if scraped_text:
-            return {"text": scraped_text, "scraped": True, "image_urls": scraped_images}
+            return {"text": scraped_text, "scraped": True}
         print(f"Article scrape failed for {article_url}, falling back to teaser text")
-
-    image_urls = _find_content_images(block, exclude_id=exclude_id)
 
     if len(raw_text) > ARTICLE_LEN_THRESHOLD:
         # X inlined a full article body directly into this block's own status
         # page — no separate fetch needed, but it's scraped content, not a
         # plain tweet, so still clean the chrome off it.
         handle = _extract_handle(block)
-        return {"text": _strip_chrome(raw_text, handle), "scraped": True, "image_urls": image_urls}
+        return {"text": _strip_chrome(raw_text, handle), "scraped": True}
 
     if clean_text_fallback:
-        return _finalize_short_text(clean_text_fallback, image_urls)
+        return _finalize_short_text(clean_text_fallback)
 
     handle = _extract_handle(block)
-    return _finalize_short_text(_strip_chrome(raw_text, handle), image_urls)
-
-
-# ---------------------------------------------------------------------------
-# Image description (OpenAI first, Anthropic fallback). Bytes only ever live
-# in memory — never written to disk or the DB.
-# ---------------------------------------------------------------------------
-
-def _guess_mime(url, content_type):
-    if content_type and content_type.startswith("image/"):
-        return content_type.split(";")[0].strip()
-    lower = url.lower()
-    if ".png" in lower:
-        return "image/png"
-    if ".gif" in lower:
-        return "image/gif"
-    if ".webp" in lower:
-        return "image/webp"
-    return "image/jpeg"
-
-
-def _download_image_bytes(url):
-    resp = httpx.get(url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
-    resp.raise_for_status()
-    return resp.content, _guess_mime(url, resp.headers.get("content-type"))
-
-
-def _describe_image_openai(image_bytes, mime):
-    from openai import OpenAI
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    b64 = base64.b64encode(image_bytes).decode()
-    resp = client.chat.completions.create(
-        model=OPENAI_VISION_MODEL,
-        max_tokens=500,
-        messages=[
-            {"role": "system", "content": VISION_INSTRUCTION},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe this image per the instructions."},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                ],
-            },
-        ],
-    )
-    return resp.choices[0].message.content.strip()
-
-
-def _describe_image_anthropic(image_bytes, mime):
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    b64 = base64.b64encode(image_bytes).decode()
-    resp = client.messages.create(
-        model=ANTHROPIC_VISION_MODEL,
-        max_tokens=500,
-        system=VISION_INSTRUCTION,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
-                    {"type": "text", "text": "Describe this image per the instructions."},
-                ],
-            }
-        ],
-    )
-    return next(b.text for b in resp.content if b.type == "text").strip()
-
-
-def _describe_image(url):
-    """Returns (description, error). description is None if both providers failed."""
-    try:
-        image_bytes, mime = _download_image_bytes(url)
-    except Exception as e:
-        return None, f"download failed: {type(e).__name__}: {e}"
-
-    openai_error = None
-    if os.getenv("OPENAI_API_KEY"):
-        try:
-            return _describe_image_openai(image_bytes, mime), None
-        except Exception as e:
-            openai_error = f"{type(e).__name__}: {e}"
-    else:
-        openai_error = "OPENAI_API_KEY not set"
-
-    if os.getenv("ANTHROPIC_API_KEY"):
-        try:
-            return _describe_image_anthropic(image_bytes, mime), None
-        except Exception as e:
-            return None, f"openai failed ({openai_error}); anthropic failed ({type(e).__name__}: {e})"
-
-    return None, f"openai failed ({openai_error}); anthropic not configured (ANTHROPIC_API_KEY not set)"
-
-
-def _describe_and_append_images(image_urls):
-    """Returns (appended_text, image_processing_status). Descriptions are
-    always appended at the end of full_content — never spliced inline."""
-    image_urls = list(dict.fromkeys(image_urls))  # dedupe, preserve order
-    if not image_urls:
-        return "", "no_images_found"
-
-    descriptions = []
-    failures = 0
-    for url in image_urls:
-        description, error = _describe_image(url)
-        if description:
-            descriptions.append(description)
-        else:
-            failures += 1
-            print(f"Image description failed for {url}: {error}")
-
-    if not descriptions:
-        return "", "images_fetch_failed"
-
-    status = "images_partially_appended" if failures else "images_appended_successfully"
-    return "\n\n".join(descriptions), status
+    return _finalize_short_text(_strip_chrome(raw_text, handle))
 
 
 # ---------------------------------------------------------------------------
 # Top-level enrichment: fetch a tweet's own status page and build the final
-# full_content / content_source / image_processing_status / quoted_tweet_id.
+# full_content / content_source / embedded_quote_tweet_id.
 # ---------------------------------------------------------------------------
 
-def _enrich_via_html(tweet_url, tweet_id, api_text, describe_images=True):
+def _enrich_via_html(tweet_url, tweet_id, api_text):
     """Returns None on hard failure (page unreachable or unexpected shape) —
-    caller falls back to the bare API tweet text. When describe_images=False,
-    images are never fetched/described at all (used for the sync-time path,
-    which only needs enriched text to write a good summary — the resulting
-    content is never persisted, so paying for vision calls here is wasted
-    work; on-demand full-content reads pass describe_images=True)."""
+    caller falls back to the bare API tweet text."""
     resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
@@ -499,7 +355,6 @@ def _enrich_via_html(tweet_url, tweet_id, api_text, describe_images=True):
     primary = _process_block(primary_block, exclude_id=quoted_id, clean_text_fallback=api_text)
     full_content = primary["text"]
     scraped_any = primary["scraped"]
-    image_urls = list(primary["image_urls"])
 
     if quoted_block is not None:
         quoted = _process_block(quoted_block, exclude_id=None)
@@ -507,39 +362,31 @@ def _enrich_via_html(tweet_url, tweet_id, api_text, describe_images=True):
         quoted_label = f"@{handle}" if handle else "the quoted tweet"
         full_content = f"{full_content}\n\n---\nQuoted {quoted_label}:\n{quoted['text']}"
         scraped_any = scraped_any or quoted["scraped"]
-        image_urls.extend(quoted["image_urls"])
-
-    if describe_images:
-        appended, image_status = _describe_and_append_images(image_urls)
-        if appended:
-            full_content = f"{full_content}\n\n{appended}"
-    else:
-        image_status = "no_images_found"
 
     return {
         "full_content": full_content.strip(),
         "content_source": "api_scraped_article" if scraped_any else "api_text",
-        "image_processing_status": image_status,
-        "quoted_tweet_id": quoted_id,
+        "embedded_quote_tweet_id": quoted_id,
     }
 
 
-def enrich_tweet_content(api_text, author_username, tweet_id, describe_images=True):
-    """Public entry point used by fetch_bookmarks(), the one-time migration
-    scripts, and the on-demand get_full_content MCP tool. Given the bare API
-    tweet text plus enough to build the tweet's own status URL, returns
-    (full_content, content_source, image_processing_status, quoted_tweet_id).
-    Falls back to the bare API text if the HTML page can't be fetched/parsed.
+def enrich_tweet_content(api_text, author_username, tweet_id):
+    """Public entry point used by the one-time migration scripts and the
+    on-demand get_full_content MCP tool. Given the bare API tweet text plus
+    enough to build the tweet's own status URL, returns (full_content,
+    content_source, embedded_quote_tweet_id). Falls back to the bare API
+    text if the HTML page can't be fetched/parsed.
 
-    describe_images=False skips vision calls entirely (sync-time path, where
-    the result is only used to write a summary and never stored) —
-    describe_images=True (default) is the on-demand full-read path."""
+    embedded_quote_tweet_id is NOT the quoted_from_tweet_id database column
+    — it's discovered fresh from this call's own live HTML parse (X's own
+    DOM nests a quote tweet's <article> inside its quoter's), unrelated to
+    and computed independently of anything already in the database."""
     api_text = api_text or ""
 
     if author_username:
         tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
         try:
-            enriched = _enrich_via_html(tweet_url, tweet_id, api_text, describe_images=describe_images)
+            enriched = _enrich_via_html(tweet_url, tweet_id, api_text)
         except Exception as e:
             print(f"HTML enrichment failed for {tweet_url}: {e}")
             enriched = None
@@ -550,65 +397,21 @@ def enrich_tweet_content(api_text, author_username, tweet_id, describe_images=Tr
         return (
             enriched["full_content"],
             enriched["content_source"],
-            enriched["image_processing_status"],
-            enriched["quoted_tweet_id"],
+            enriched["embedded_quote_tweet_id"],
         )
 
     content_source = "api_teaser_only" if BARE_LINK_RE.match(api_text.strip()) else "api_text"
-    return api_text, content_source, "no_images_found", None
-
-
-def backfill_missing_images(author_username, tweet_id, existing_full_content):
-    """For a bookmark synced before the image-description pipeline existed:
-    fetch the tweet's own status page, find any content images ON THE
-    PRIMARY TWEET ONLY (never the quoted tweet's — these bookmarks predate
-    quote-tweet handling entirely, so there's no established quoted-tweet
-    section in existing_full_content to append into), describe them, and
-    append. Doesn't touch anything else — no article/quote-tweet detection,
-    no text changes beyond the append.
-
-    Returns (new_full_content, image_processing_status), or None if no
-    fetchable images were found (page unreachable, or nothing there
-    anymore) — caller should leave the row untouched in that case."""
-    if not author_username:
-        return None
-
-    tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
-    try:
-        resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"Fetch failed for {tweet_url}: {e}")
-        return None
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    primary_block = soup.find("article", attrs={"data-tweet-id": tweet_id})
-    if primary_block is None:
-        return None
-
-    quoted_block = primary_block.find("article", attrs={"data-tweet-id": True})
-    quoted_id = quoted_block.get("data-tweet-id") if quoted_block else None
-
-    image_urls = _find_content_images(primary_block, exclude_id=quoted_id)
-    if not image_urls:
-        return None
-
-    appended, image_status = _describe_and_append_images(image_urls)
-    if not appended:
-        return None
-
-    new_content = f"{existing_full_content}\n\n{appended}".strip()
-    return new_content, image_status
+    return api_text, content_source, None
 
 
 # ---------------------------------------------------------------------------
 # Sync-time content resolution: decides, per tweet (recursively for anything
-# it quotes), whether its own text is substantial enough to summarize
-# directly, or whether it's just a pointer to the real content — a linked
-# X article, a linked PDF, or (not yet built) an arbitrary external site.
-# A quoted tweet is never merged into its quoter's text — it becomes its own
-# row, up to 3 levels deep (OP -> QP -> QQP). Images are never touched here;
-# that's exclusively get_full_content's job, on demand.
+# it quotes), how much a row's own text (and separately, whatever a link in
+# it points to) is worth — nothing (skip the LLM entirely), enough to
+# categorize/tag but not summarize independently, or enough to summarize for
+# real. A quoted tweet is never merged into its quoter's text — it becomes
+# its own row, up to 3 levels deep (OP -> QP -> QQP). Images are never
+# touched here — image description doesn't exist anywhere in this app.
 # ---------------------------------------------------------------------------
 
 def _extract_first_url(text):
@@ -629,11 +432,15 @@ def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=
     that (the top-level bookmark falls back to bare API text; a quoted
     tweet found unreachable is simply dropped, no row for it).
 
-    Returns a dict: tweet_id, author_username, post_text (the verbatim short
-    text, set only when word count is at/under WORD_COUNT_THRESHOLD),
-    content_for_summary (the real content to summarize — None means nothing
-    substantial was found anywhere), and quoted_child (a nested dict of the
-    same shape for whatever this tweet quotes, or None)."""
+    Returns a dict: tweet_id, author_username, post_text (set whenever this
+    row isn't going through real summarization — the verbatim own text,
+    plus any resolved link content appended), content_for_summary (text to
+    hand the categorizer — None means nothing substantial anywhere, LLM
+    skipped entirely for this row), force_summary_sentinel (True when
+    content_for_summary is only there for category/tags — the LLM's summary
+    output for this row gets discarded and replaced with
+    NOT_ENOUGH_CONTENT_SUMMARY), and quoted_child (a nested dict of the same
+    shape for whatever this tweet quotes, or None)."""
     tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
     try:
         resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
@@ -670,31 +477,52 @@ def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=
     else:
         own_text = html_own_text
 
-    word_count = len(own_text.split())
+    own_word_count = len(own_text.split())
 
-    if word_count > WORD_COUNT_THRESHOLD:
+    # A link is chased for every post, regardless of its own length — a
+    # 250-word post with a link at the end still deserves the linked
+    # content folded into its summary, not just its own words.
+    external_text = None
+    external_word_count = 0
+    url = _extract_first_url(own_text)
+    if url:
+        normalized_url = url if url.startswith("http") else f"https://{url}"
+        try:
+            external_text = _resolve_external_link(normalized_url)
+        except Exception as e:
+            print(f"Link resolution failed for {normalized_url}: {e}")
+        if external_text:
+            external_word_count = len(external_text.split())
+
+    if own_word_count >= MIN_SUMMARIZE_WORDS or external_word_count >= MIN_SUMMARIZE_WORDS:
+        # Enough for a real summary — combine own text with whatever the
+        # link resolved to, whenever there is one, regardless of which side
+        # actually cleared the bar.
         post_text = None
-        content_for_summary = own_text
+        content_for_summary = (
+            f"{own_text}\n\n---\nLinked content:\n{external_text}" if external_text else own_text
+        )
+        force_summary_sentinel = False
+    elif own_word_count >= MIN_CATEGORIZE_WORDS or MIN_CATEGORIZE_WORDS <= external_word_count < MIN_SUMMARIZE_WORDS:
+        # Enough to categorize/tag for real, not enough to summarize on its
+        # own — store verbatim (own text, plus a short linked snippet
+        # appended if that's what pushed it into this band), and mark the
+        # LLM's own summary attempt to be discarded after the fact.
+        if external_text:
+            post_text = (
+                external_text if is_bare_url_only(own_text.strip())
+                else f"{own_text}\n\n---\nLinked content:\n{external_text}"
+            )
+        else:
+            post_text = own_text
+        content_for_summary = post_text
+        force_summary_sentinel = True
     else:
+        # Nothing substantial anywhere — own text is thin, and there's
+        # either no link or the link didn't resolve to anything worthwhile.
         post_text = own_text
         content_for_summary = None
-
-        url = _extract_first_url(own_text)
-        if url:
-            if not url.startswith("http"):
-                url = f"https://{url}"
-            pdf_bytes = _fetch_pdf_bytes_if_pdf(url)
-            if pdf_bytes:
-                try:
-                    pdf_text = _extract_pdf_text(pdf_bytes)
-                    if pdf_text.strip():
-                        content_for_summary = _classify_and_extract_abstract(pdf_text)
-                except Exception as e:
-                    print(f"PDF handling failed for {url}: {e}")
-            # else: url isn't a PDF. Arbitrary external-site scraping (a
-            # plain blog post, GitHub README, etc) is a known TODO, not yet
-            # built — content_for_summary stays None (-> not_enough_content)
-            # for a thin post whose only substance is a non-PDF external link.
+        force_summary_sentinel = False
 
     quoted_child = None
     if quoted_block is not None and depth < max_depth:
@@ -709,6 +537,7 @@ def _resolve_tweet(tweet_id, author_username, api_text=None, depth=1, max_depth=
         "author_username": author_username,
         "post_text": post_text,
         "content_for_summary": content_for_summary,
+        "force_summary_sentinel": force_summary_sentinel,
         "quoted_child": quoted_child,
     }
 
@@ -722,6 +551,7 @@ def _flatten_resolved_tree(resolved, quoted_from=None):
         "author_username": resolved["author_username"],
         "post_text": resolved["post_text"],
         "content_for_summary": resolved["content_for_summary"],
+        "force_summary_sentinel": resolved["force_summary_sentinel"],
         "quoted_from_tweet_id": quoted_from,
     }
     rows = [row]
@@ -736,7 +566,8 @@ def resolve_bookmark_rows(tweet_id, author_username, api_text):
     MAX_QUOTE_DEPTH — into a flat list of row-ready dicts. The bookmarked
     tweet itself (OP) is always the first entry, even if its own status
     page turns out to be unreachable (falls back to the bare API text
-    rather than being dropped); any quoted tweet found unreachable is
+    rather than being dropped, with no link-chasing — just a word-count
+    check against the bare text); any quoted tweet found unreachable is
     simply absent from the list, not present as a broken row."""
     resolved = None
     if author_username:
@@ -748,15 +579,18 @@ def resolve_bookmark_rows(tweet_id, author_username, api_text):
     if resolved is None:
         api_text = api_text or ""
         word_count = len(api_text.split())
-        if word_count > WORD_COUNT_THRESHOLD:
-            post_text, content_for_summary = None, api_text
+        if word_count >= MIN_SUMMARIZE_WORDS:
+            post_text, content_for_summary, force_summary_sentinel = None, api_text, False
+        elif word_count >= MIN_CATEGORIZE_WORDS:
+            post_text, content_for_summary, force_summary_sentinel = api_text, api_text, True
         else:
-            post_text, content_for_summary = api_text, None
+            post_text, content_for_summary, force_summary_sentinel = api_text, None, False
         resolved = {
             "tweet_id": tweet_id,
             "author_username": author_username,
             "post_text": post_text,
             "content_for_summary": content_for_summary,
+            "force_summary_sentinel": force_summary_sentinel,
             "quoted_child": None,
         }
 
@@ -839,13 +673,15 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
                     # Nothing substantial anywhere for this row — decided
                     # deterministically (word count), so skip the LLM call
                     # entirely rather than asking it to summarize nothing.
-                    bookmark["category"] = RESERVED_THIN_CONTENT_CATEGORY
-                    bookmark["summary"] = "not_enough_content"
-                    bookmark["tags"] = json.dumps([RESERVED_FALLBACK_TAG])
+                    bookmark["category"] = NOT_ENOUGH_CONTENT_CATEGORY
+                    bookmark["summary"] = NOT_ENOUGH_CONTENT_SUMMARY
+                    bookmark["tags"] = json.dumps([NOT_ENOUGH_CONTENT_TAG])
                 else:
                     # category/summary/tags deliberately absent — the
                     # caller runs this through categorize_bookmarks() next.
                     bookmark["content_for_summary"] = content_for_summary
+                    if row["force_summary_sentinel"]:
+                        bookmark["_force_summary_sentinel"] = True
 
                 page_results.append(bookmark)
 

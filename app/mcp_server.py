@@ -203,7 +203,7 @@ def trigger_sync() -> dict:
 
         # Rows with a real content_for_summary need the LLM; rows already
         # resolved deterministically (nothing substantial anywhere) skip it
-        # entirely — see resolve_bookmark_rows / RESERVED_THIN_CONTENT_CATEGORY.
+        # entirely — see resolve_bookmark_rows / NOT_ENOUGH_CONTENT_CATEGORY.
         needs_categorization = [t for t in new_tweets if "category" not in t]
         already_resolved = [t for t in new_tweets if "category" in t]
 
@@ -286,14 +286,14 @@ def get_authors() -> list[dict]:
     return [{"author_username": row[0], "count": row[1]} for row in rows]
 
 
-# DEAD as of the "don't store full articles / don't describe images at sync
-# time" redesign — content_source and image_processing_status stop being
+# DEAD as of the "don't store full articles / remove image description
+# entirely" redesign — content_source and image_processing_status stop being
 # meaningful signals for anything synced afterward (content_source no longer
-# reflects what's stored, since full_content is just the raw tweet text
-# either way; image_processing_status is never anything but the default,
-# since images are never processed at sync time anymore). Left commented
-# rather than deleted since they're still valid for pre-redesign rows if
-# ever needed again.
+# reflects what's stored, since full_content just mirrors post_text either
+# way; image_processing_status is never anything but the default, since
+# image description doesn't exist anywhere in this app anymore). Left
+# commented rather than deleted since they're still valid for pre-redesign
+# rows if ever needed again.
 #
 # @mcp.tool()
 # def get_bookmarks_by_content_source(content_source: str, limit: int = 50) -> list[dict]:
@@ -375,11 +375,11 @@ def add_tag_to_bookmark(tweet_id: str, tag: str) -> dict:
 @mcp.tool()
 def get_full_content(tweet_id: str) -> dict:
     """Fetch the FULL enriched content for exactly ONE bookmark, live, right now — article body
-    scraped, quote-tweet text merged, images described. None of this is stored in the database;
-    only the summary is kept long-term, so this re-derives the full article on every call.
+    scraped, quote-tweet text merged, and any linked external article or PDF (abstract, if it's a
+    research paper) resolved. None of this is stored in the database; only the summary is kept
+    long-term, so this re-derives the full content on every call.
 
-    This is a real-time fetch, not a cheap lookup — expect it to take several seconds, longer if
-    there are images to describe.
+    This is a real-time fetch, not a cheap lookup — expect it to take several seconds.
 
     IMPORTANT: call this for ONE tweet_id at a time only. After reading the result, present your
     findings on this specific article to the user BEFORE calling this tool again for a different
@@ -395,13 +395,12 @@ def get_full_content(tweet_id: str) -> dict:
 
     from app.pipeline.fetch import enrich_tweet_content
 
-    full_content, content_source, image_processing_status, quoted_tweet_id = enrich_tweet_content(
-        row["full_content"], row["author_username"], tweet_id, describe_images=True
+    full_content, content_source, embedded_quote_tweet_id = enrich_tweet_content(
+        row["full_content"], row["author_username"], tweet_id
     )
     return {
         "tweet_id": tweet_id,
         "full_content": full_content,
         "content_source": content_source,
-        "image_processing_status": image_processing_status,
-        "quoted_tweet_id": quoted_tweet_id,
+        "embedded_quote_tweet_id": embedded_quote_tweet_id,
     }
