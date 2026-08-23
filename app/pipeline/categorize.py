@@ -58,7 +58,7 @@ BASE_SYSTEM_PROMPT = """You are analyzing a collection of bookmarked posts from 
 1. Identify meaningful, specific categories that reflect the actual content themes
 2. Assign each post to exactly one category
 3. Assign each post one or more tags from a fixed list (see below)
-4. Write a ~128 word summary for each post capturing its key insight or argument
+4. Write a ~200 word summary for each post capturing its key insight or argument
 
 Category rules:
 - Create 5-15 categories maximum, depending on content diversity
@@ -67,6 +67,7 @@ Category rules:
 - If a post's own text is minimal (a short reaction, a caption, or barely anything) and the actual content is mostly a link, image, or video with no substantive written topic to infer, assign category exactly "{thin_category}" instead of forcing it into an unrelated topical category
 
 Summary rules:
+- The summary is the only record of this post's content that gets kept long-term — the full text is not stored. Write it like an academic abstract: dense enough that someone deciding whether to go read the full post can do so from the summary alone, without needing to guess what's actually in it
 - Summaries must capture what the post actually argues or reveals, not just describe it
 
 Output rules:
@@ -163,7 +164,11 @@ def categorize_bookmarks(bookmarks, existing_categories=None, known_tags=None, o
 
 def _categorize_batch(system_prompt, batch):
     posts = [
-        {"tweet_id": b["tweet_id"], "content": b["full_content"], "author": b.get("author_username", "")}
+        {
+            "tweet_id": b["tweet_id"],
+            "content": b.get("content_for_summary") or b.get("full_content", ""),
+            "author": b.get("author_username", ""),
+        }
         for b in batch
     ]
     user_prompt = (
@@ -171,7 +176,7 @@ def _categorize_batch(system_prompt, batch):
         "- tweet_id (string, unchanged from input)\n"
         "- category (string)\n"
         "- tags (array of strings, from the fixed tag list)\n"
-        "- summary (string, ~128 words)\n\n"
+        "- summary (string, ~200 words)\n\n"
         f"Posts:\n{json.dumps(posts, indent=2)}"
     )
 

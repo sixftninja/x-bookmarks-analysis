@@ -474,9 +474,13 @@ def _describe_and_append_images(image_urls):
 # full_content / content_source / image_processing_status / quoted_tweet_id.
 # ---------------------------------------------------------------------------
 
-def _enrich_via_html(tweet_url, tweet_id, api_text):
+def _enrich_via_html(tweet_url, tweet_id, api_text, describe_images=True):
     """Returns None on hard failure (page unreachable or unexpected shape) —
-    caller falls back to the bare API tweet text."""
+    caller falls back to the bare API tweet text. When describe_images=False,
+    images are never fetched/described at all (used for the sync-time path,
+    which only needs enriched text to write a good summary — the resulting
+    content is never persisted, so paying for vision calls here is wasted
+    work; on-demand full-content reads pass describe_images=True)."""
     resp = httpx.get(tweet_url, timeout=30, follow_redirects=True, headers=BROWSER_HEADERS)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
@@ -501,9 +505,12 @@ def _enrich_via_html(tweet_url, tweet_id, api_text):
         scraped_any = scraped_any or quoted["scraped"]
         image_urls.extend(quoted["image_urls"])
 
-    appended, image_status = _describe_and_append_images(image_urls)
-    if appended:
-        full_content = f"{full_content}\n\n{appended}"
+    if describe_images:
+        appended, image_status = _describe_and_append_images(image_urls)
+        if appended:
+            full_content = f"{full_content}\n\n{appended}"
+    else:
+        image_status = "no_images_found"
 
     return {
         "full_content": full_content.strip(),
@@ -513,18 +520,22 @@ def _enrich_via_html(tweet_url, tweet_id, api_text):
     }
 
 
-def enrich_tweet_content(api_text, author_username, tweet_id):
-    """Public entry point used by fetch_bookmarks() and the one-time
-    migration script. Given the bare API tweet text plus enough to build the
-    tweet's own status URL, returns
+def enrich_tweet_content(api_text, author_username, tweet_id, describe_images=True):
+    """Public entry point used by fetch_bookmarks(), the one-time migration
+    scripts, and the on-demand get_full_content MCP tool. Given the bare API
+    tweet text plus enough to build the tweet's own status URL, returns
     (full_content, content_source, image_processing_status, quoted_tweet_id).
-    Falls back to the bare API text if the HTML page can't be fetched/parsed."""
+    Falls back to the bare API text if the HTML page can't be fetched/parsed.
+
+    describe_images=False skips vision calls entirely (sync-time path, where
+    the result is only used to write a summary and never stored) —
+    describe_images=True (default) is the on-demand full-read path."""
     api_text = api_text or ""
 
     if author_username:
         tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
         try:
-            enriched = _enrich_via_html(tweet_url, tweet_id, api_text)
+            enriched = _enrich_via_html(tweet_url, tweet_id, api_text, describe_images=describe_images)
         except Exception as e:
             print(f"HTML enrichment failed for {tweet_url}: {e}")
             enriched = None
@@ -633,9 +644,14 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
                 all_known = False
             author = users_map.get(tweet.get("author_id", ""), {})
             author_username = author.get("username")
+            raw_text = tweet.get("text", "")
 
-            full_content, content_source, image_processing_status, quoted_tweet_id = enrich_tweet_content(
-                tweet.get("text", ""), author_username, tweet_id
+            # Enriched text (article scrape, quote-tweet merge — no images,
+            # that's on-demand only) is used ONLY to write a good summary
+            # below; it's never stored. full_content stays the original,
+            # cheap API text — see the "don't store the article" decision.
+            content_for_summary, content_source, image_processing_status, quoted_tweet_id = enrich_tweet_content(
+                raw_text, author_username, tweet_id, describe_images=False
             )
 
             page_results.append(
@@ -643,7 +659,8 @@ def fetch_bookmarks(existing_tweet_ids=None, db_path=None):
                     "tweet_id": tweet_id,
                     "author_username": author_username,
                     "author_name": author.get("name"),
-                    "full_content": full_content,
+                    "full_content": raw_text,
+                    "content_for_summary": content_for_summary,
                     "content_source": content_source,
                     "image_processing_status": image_processing_status,
                     "quoted_tweet_id": quoted_tweet_id,
