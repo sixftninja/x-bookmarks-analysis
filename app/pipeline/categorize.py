@@ -185,7 +185,7 @@ def _categorize_batch(system_prompt, batch):
     posts = [
         {
             "tweet_id": b["tweet_id"],
-            "content": b.get("content_for_summary") or b.get("full_content", ""),
+            "content": b.get("content_for_summary", ""),
             "author": b.get("author_username", ""),
         }
         for b in batch

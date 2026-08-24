@@ -9,7 +9,7 @@ unless this script is run.
 For each existing top-level bookmark (quoted_from_tweet_id IS NULL — i.e.
 everything, since no row has ever had that set before this script runs):
   - re-fetch its status page fresh and resolve it via resolve_bookmark_rows
-  - UPDATE that row's post_text/full_content/category/summary/tags in place
+  - UPDATE that row's post_text/category/summary/tags in place
     (author_name/media_urls/tweet_url/bookmarked_at are left untouched —
     those came from the original sync and this script has no API access to
     recompute them)
@@ -54,11 +54,10 @@ def _update_op_row(db_path, bookmark):
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """UPDATE bookmarks
-               SET post_text = ?, full_content = ?, category = ?, summary = ?, tags = ?
+               SET post_text = ?, category = ?, summary = ?, tags = ?
                WHERE tweet_id = ?""",
             (
                 bookmark["post_text"],
-                bookmark["full_content"],
                 bookmark["category"],
                 bookmark["summary"],
                 bookmark["tags"],

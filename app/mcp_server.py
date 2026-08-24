@@ -5,26 +5,17 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("X Bookmarks")
 
-# Single-bookmark lookups only — includes full_content (which, for anything
-# synced after the storage redesign, just mirrors post_text — the real
-# enriched content lives in summary, or use get_full_content for a live
-# re-derivation).
+# The real enriched content lives in summary (~200 words) or post_text
+# (verbatim, for a row too thin to independently summarize) — neither gets
+# large enough to need a separate, trimmed field list for multi-result
+# tools, unlike the old full_content column this replaced (some pre-redesign
+# rows carried 20,000+ characters of scraped article, large enough to break
+# at least one client's tool-result handling when returned for every match
+# in a list/search call). Use get_full_content for a live, on-demand full
+# read of any one bookmark.
 BOOKMARK_FIELDS = (
-    "tweet_id, author_username, author_name, category, summary, full_content, "
-    "tweet_url, bookmarked_at, content_source, image_processing_status, tags, "
-    "post_text, quoted_from_tweet_id"
-)
-
-# Multi-result tools — deliberately excludes full_content. Some rows still
-# carry pre-redesign scraped articles 20,000+ characters long; returning
-# that for every match in a list/search call produced response payloads
-# large enough to break at least one client's tool-result handling. The
-# 200-word summary is meant to carry the "can I judge relevance from this"
-# job that full_content used to.
-LIST_FIELDS = (
     "tweet_id, author_username, author_name, category, summary, "
-    "tweet_url, bookmarked_at, content_source, image_processing_status, tags, "
-    "post_text, quoted_from_tweet_id"
+    "tweet_url, bookmarked_at, tags, post_text, quoted_from_tweet_id"
 )
 
 
@@ -68,7 +59,7 @@ def get_bookmarks_by_category(category: str, limit: int = 50) -> list[dict]:
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT {LIST_FIELDS}
+            f"""SELECT {BOOKMARK_FIELDS}
                FROM bookmarks WHERE LOWER(category) = LOWER(?)
                ORDER BY bookmarked_at DESC LIMIT ?""",
             (category, min(limit, 200)),
@@ -78,15 +69,14 @@ def get_bookmarks_by_category(category: str, limit: int = 50) -> list[dict]:
 
 @mcp.tool()
 def search_bookmarks(query: str, limit: int = 20) -> list[dict]:
-    """Search bookmarks by keyword, matching against the summary and (for older bookmarks that
-    still have one stored) the full article text. Returns summary, not full article text —
-    call get_full_content(tweet_id) for that, one at a time."""
+    """Search bookmarks by keyword, matching against the summary and post_text. Returns summary,
+    not full article text — call get_full_content(tweet_id) for that, one at a time."""
     term = f"%{query}%"
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT {LIST_FIELDS}
-               FROM bookmarks WHERE summary LIKE ? OR full_content LIKE ?
+            f"""SELECT {BOOKMARK_FIELDS}
+               FROM bookmarks WHERE summary LIKE ? OR post_text LIKE ?
                ORDER BY bookmarked_at DESC LIMIT ?""",
             (term, term, min(limit, 100)),
         ).fetchall()
@@ -100,7 +90,7 @@ def get_recent_bookmarks(n: int = 20) -> list[dict]:
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT {LIST_FIELDS}
+            f"""SELECT {BOOKMARK_FIELDS}
                FROM bookmarks ORDER BY categorized_at DESC LIMIT ?""",
             (min(n, 100),),
         ).fetchall()
@@ -226,8 +216,8 @@ def trigger_sync() -> dict:
 
 @mcp.tool()
 def edit_bookmark(tweet_id: str, category: str = None, summary: str = None) -> dict:
-    """Edit the category and/or summary of a specific bookmark. full_content is no longer
-    editable here — it's not the persisted article anymore (see get_full_content)."""
+    """Edit the category and/or summary of a specific bookmark. The full article isn't persisted
+    anywhere — see get_full_content for a live, on-demand read instead."""
     if not category and not summary:
         return {"error": "Provide at least one of: category, summary"}
     fields = []
@@ -269,7 +259,7 @@ def get_bookmarks_by_author(author_username: str, limit: int = 50) -> list[dict]
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT {LIST_FIELDS} FROM bookmarks WHERE LOWER(author_username) = LOWER(?)
+            f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE LOWER(author_username) = LOWER(?)
                ORDER BY bookmarked_at DESC LIMIT ?""",
             (handle, min(limit, 200)),
         ).fetchall()
@@ -286,41 +276,6 @@ def get_authors() -> list[dict]:
     return [{"author_username": row[0], "count": row[1]} for row in rows]
 
 
-# DEAD as of the "don't store full articles / remove image description
-# entirely" redesign — content_source and image_processing_status stop being
-# meaningful signals for anything synced afterward (content_source no longer
-# reflects what's stored, since full_content just mirrors post_text either
-# way; image_processing_status is never anything but the default, since
-# image description doesn't exist anywhere in this app anymore). Left
-# commented rather than deleted since they're still valid for pre-redesign
-# rows if ever needed again.
-#
-# @mcp.tool()
-# def get_bookmarks_by_content_source(content_source: str, limit: int = 50) -> list[dict]:
-#     """Get bookmarks by content_source: api_text, api_scraped_article, manual, or api_teaser_only (still broken/unresolved)."""
-#     with sqlite3.connect(_db()) as conn:
-#         conn.row_factory = sqlite3.Row
-#         rows = conn.execute(
-#             f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE content_source = ?
-#                ORDER BY bookmarked_at DESC LIMIT ?""",
-#             (content_source, min(limit, 200)),
-#         ).fetchall()
-#     return [_row_with_parsed_tags(row) for row in rows]
-#
-#
-# @mcp.tool()
-# def get_bookmarks_by_image_processing_status(image_processing_status: str, limit: int = 50) -> list[dict]:
-#     """Get bookmarks by image_processing_status: images_appended_successfully, images_partially_appended, images_fetch_failed, or no_images_found."""
-#     with sqlite3.connect(_db()) as conn:
-#         conn.row_factory = sqlite3.Row
-#         rows = conn.execute(
-#             f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE image_processing_status = ?
-#                ORDER BY bookmarked_at DESC LIMIT ?""",
-#             (image_processing_status, min(limit, 200)),
-#         ).fetchall()
-#     return [_row_with_parsed_tags(row) for row in rows]
-
-
 @mcp.tool()
 def get_bookmarks_by_tag(tags: list[str], match_all: bool = True, limit: int = 50) -> list[dict]:
     """Get bookmarks carrying one or more tags. match_all=True (default) requires every listed tag
@@ -330,7 +285,7 @@ def get_bookmarks_by_tag(tags: list[str], match_all: bool = True, limit: int = 5
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"SELECT {LIST_FIELDS} FROM bookmarks WHERE tags IS NOT NULL ORDER BY bookmarked_at DESC"
+            f"SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE tags IS NOT NULL ORDER BY bookmarked_at DESC"
         ).fetchall()
 
     matched = []
@@ -387,7 +342,7 @@ def get_full_content(tweet_id: str) -> dict:
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT tweet_id, author_username, full_content FROM bookmarks WHERE tweet_id = ?",
+            "SELECT tweet_id, author_username, post_text FROM bookmarks WHERE tweet_id = ?",
             (tweet_id,),
         ).fetchone()
     if row is None:
@@ -396,7 +351,7 @@ def get_full_content(tweet_id: str) -> dict:
     from app.pipeline.fetch import enrich_tweet_content
 
     full_content, content_source, embedded_quote_tweet_id = enrich_tweet_content(
-        row["full_content"], row["author_username"], tweet_id
+        row["post_text"], row["author_username"], tweet_id
     )
     return {
         "tweet_id": tweet_id,

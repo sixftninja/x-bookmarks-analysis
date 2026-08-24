@@ -687,7 +687,6 @@ def build_bookmark_dict(row, is_op, author_name=None, media_urls=None, bookmarke
         "author_username": row_author,
         "author_name": author_name if is_op else None,
         "post_text": row["post_text"],
-        "full_content": row["post_text"],
         "quoted_from_tweet_id": row["quoted_from_tweet_id"],
         "media_urls": media_urls if is_op else None,
         "tweet_url": (

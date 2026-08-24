@@ -35,7 +35,7 @@ def bookmarks_by_category(name: str, limit: int = Query(default=50, le=200)):
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT id, tweet_id, author_username, author_name, category,
-                      summary, full_content, tweet_url, bookmarked_at
+                      summary, post_text, tweet_url, bookmarked_at
                FROM bookmarks
                WHERE LOWER(category) = LOWER(?)
                ORDER BY bookmarked_at DESC
@@ -54,9 +54,9 @@ def search_bookmarks(q: str, limit: int = Query(default=20, le=100)):
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT id, tweet_id, author_username, author_name, category,
-                      summary, full_content, tweet_url, bookmarked_at
+                      summary, post_text, tweet_url, bookmarked_at
                FROM bookmarks
-               WHERE summary LIKE ? OR full_content LIKE ?
+               WHERE summary LIKE ? OR post_text LIKE ?
                ORDER BY bookmarked_at DESC
                LIMIT ?""",
             (term, term, limit),
@@ -70,7 +70,7 @@ def recent_bookmarks(n: int = Query(default=20, le=100)):
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT id, tweet_id, author_username, author_name, category,
-                      summary, full_content, tweet_url, bookmarked_at
+                      summary, post_text, tweet_url, bookmarked_at
                FROM bookmarks
                ORDER BY categorized_at DESC
                LIMIT ?""",

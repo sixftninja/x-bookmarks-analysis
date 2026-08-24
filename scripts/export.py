@@ -15,7 +15,7 @@ with sqlite3.connect(db) as conn:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT tweet_id, author_username, author_name, category,
-                  summary, full_content, tweet_url, bookmarked_at
+                  summary, post_text, tweet_url, bookmarked_at
            FROM bookmarks ORDER BY category, bookmarked_at DESC"""
     ).fetchall()
 
