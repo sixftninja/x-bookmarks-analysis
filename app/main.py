@@ -4,7 +4,7 @@ from app.db import init_db
 from app.mcp_server import mcp
 import os
 
-app = FastAPI(title="X Bookmarks Analysis API")
+app = FastAPI(title="ResearchScout API")
 
 
 @app.on_event("startup")

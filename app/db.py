@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     categorized_at TEXT DEFAULT (datetime('now')),
     quoted_from_tweet_id TEXT,
     tags TEXT,
-    post_text TEXT
+    post_text TEXT,
+    source_type TEXT NOT NULL DEFAULT 'x_post',
+    reviewed INTEGER NOT NULL DEFAULT 0,
+    review_notes TEXT
 );
 """
 
@@ -32,6 +35,15 @@ _ADDED_COLUMNS = [
     ("quoted_from_tweet_id", "TEXT"),
     ("tags", "TEXT"),  # JSON array of strings, e.g. '["Open Source", "Cloud Hosting & Inference Costs"]'
     ("post_text", "TEXT"),  # verbatim short (<40-300 word) post text; NULL when the row's own summary covers it instead
+    # ResearchScout: source_type distinguishes an X post from a manually-added
+    # article (tweet_id/tweet_url are reused as a generic id/url for the
+    # latter rather than renamed — see add_source). reviewed/review_notes are
+    # the human triage layer: whether a row's been looked at, and — if so —
+    # the actual conclusion (in the human's own words, or the AI's on their
+    # behalf), never an automated judgment.
+    ("source_type", "TEXT NOT NULL DEFAULT 'x_post'"),
+    ("reviewed", "INTEGER NOT NULL DEFAULT 0"),
+    ("review_notes", "TEXT"),
 ]
 
 # full_content, content_source, and image_processing_status are dead —
@@ -111,16 +123,21 @@ def insert_bookmarks(bookmarks, db_path=DEFAULT_DB):
         INSERT OR IGNORE INTO bookmarks
             (tweet_id, author_username, author_name, category, summary,
              media_urls, tweet_url, bookmarked_at,
-             quoted_from_tweet_id, tags, post_text)
+             quoted_from_tweet_id, tags, post_text,
+             source_type, reviewed, review_notes)
         VALUES
             (:tweet_id, :author_username, :author_name, :category, :summary,
              :media_urls, :tweet_url, :bookmarked_at,
-             :quoted_from_tweet_id, :tags, :post_text)
+             :quoted_from_tweet_id, :tags, :post_text,
+             :source_type, :reviewed, :review_notes)
     """
     defaults = {
         "quoted_from_tweet_id": None,
         "tags": "[]",
         "post_text": None,
+        "source_type": "x_post",
+        "reviewed": 0,
+        "review_notes": None,
     }
     rows = [{**defaults, **b} for b in bookmarks]
     with sqlite3.connect(db_path) as conn:

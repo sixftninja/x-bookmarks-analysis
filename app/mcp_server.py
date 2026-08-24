@@ -1,9 +1,11 @@
+import hashlib
 import json
 import os
 import sqlite3
+from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("X Bookmarks")
+mcp = FastMCP("ResearchScout")
 
 # The real enriched content lives in summary (~200 words) or post_text
 # (verbatim, for a row too thin to independently summarize) — neither gets
@@ -15,7 +17,8 @@ mcp = FastMCP("X Bookmarks")
 # read of any one bookmark.
 BOOKMARK_FIELDS = (
     "tweet_id, author_username, author_name, category, summary, "
-    "tweet_url, bookmarked_at, tags, post_text, quoted_from_tweet_id"
+    "tweet_url, bookmarked_at, tags, post_text, quoted_from_tweet_id, "
+    "source_type, reviewed, review_notes"
 )
 
 
@@ -29,6 +32,8 @@ def _row_with_parsed_tags(row):
         d["tags"] = json.loads(d["tags"]) if d.get("tags") else []
     except (json.JSONDecodeError, TypeError):
         d["tags"] = []
+    if "reviewed" in d:
+        d["reviewed"] = bool(d["reviewed"])
     return d
 
 
@@ -254,7 +259,9 @@ def get_bookmark_by_tweet_id(tweet_id: str) -> dict:
 
 @mcp.tool()
 def get_bookmarks_by_author(author_username: str, limit: int = 50) -> list[dict]:
-    """Get bookmarks from a specific X author. Case-insensitive, matches with or without the @ sign."""
+    """Get bookmarks from a specific author — an X handle for X posts, or a source domain
+    (e.g. "latent.space") for manually-added articles. Case-insensitive, matches with or
+    without a leading @."""
     handle = author_username.lstrip("@")
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
@@ -268,7 +275,8 @@ def get_bookmarks_by_author(author_username: str, limit: int = 50) -> list[dict]
 
 @mcp.tool()
 def get_authors() -> list[dict]:
-    """Get every author with a bookmark, and how many bookmarks each has, sorted by count descending."""
+    """Get every author (X handle or article source domain) with a bookmark, and how many
+    each has, sorted by count descending."""
     with sqlite3.connect(_db()) as conn:
         rows = conn.execute(
             "SELECT author_username, COUNT(*) as count FROM bookmarks GROUP BY author_username ORDER BY count DESC"
@@ -329,24 +337,37 @@ def add_tag_to_bookmark(tweet_id: str, tag: str) -> dict:
 
 @mcp.tool()
 def get_full_content(tweet_id: str) -> dict:
-    """Fetch the FULL enriched content for exactly ONE bookmark, live, right now — article body
-    scraped, quote-tweet text merged, and any linked external article or PDF (abstract, if it's a
-    research paper) resolved. None of this is stored in the database; only the summary is kept
-    long-term, so this re-derives the full content on every call.
+    """Fetch the FULL content for exactly ONE entry, live, right now — for an X post: article
+    body scraped, quote-tweet text merged, and any linked external article or PDF (abstract, if
+    it's a research paper) resolved. For a manually-added article: the article itself, re-scraped
+    fresh. None of this is stored in the database; only the summary is kept long-term, so this
+    re-derives the full content on every call.
 
     This is a real-time fetch, not a cheap lookup — expect it to take several seconds.
 
-    IMPORTANT: call this for ONE tweet_id at a time only. After reading the result, present your
-    findings on this specific article to the user BEFORE calling this tool again for a different
-    tweet_id. Never call it more than once in the same response."""
+    IMPORTANT: call this for ONE id at a time only. After reading the result, present your
+    findings on this specific item to the user BEFORE calling this tool again for a different
+    id. Never call it more than once in the same response."""
     with sqlite3.connect(_db()) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT tweet_id, author_username, post_text FROM bookmarks WHERE tweet_id = ?",
+            "SELECT tweet_id, author_username, post_text, tweet_url, source_type FROM bookmarks WHERE tweet_id = ?",
             (tweet_id,),
         ).fetchone()
     if row is None:
         return {"error": f"No bookmark found with tweet_id {tweet_id}"}
+
+    if row["source_type"] == "article":
+        from app.pipeline.fetch import _resolve_external_link
+
+        if not row["tweet_url"]:
+            return {"error": f"No source URL stored for {tweet_id}"}
+        text = _resolve_external_link(row["tweet_url"])
+        return {
+            "tweet_id": tweet_id,
+            "full_content": text or row["post_text"] or "",
+            "source_type": "article",
+        }
 
     from app.pipeline.fetch import enrich_tweet_content
 
@@ -358,4 +379,141 @@ def get_full_content(tweet_id: str) -> dict:
         "full_content": full_content,
         "content_source": content_source,
         "embedded_quote_tweet_id": embedded_quote_tweet_id,
+        "source_type": "x_post",
     }
+
+
+@mcp.tool()
+def add_source(url: str, notes: str = None) -> dict:
+    """Add an external source (an article, a paper, a blog post — anything outside X) to
+    ResearchScout. Use this when the user shares a link and asks to save/add it. Fetches and
+    resolves the content (a PDF's abstract if it's a research paper, otherwise a generic article
+    scrape), then categorizes/tags/summarizes it the same way an X post would be.
+
+    Pass notes if this has already been discussed and there's a conclusion to record (in the
+    user's own words, or written on their behalf if asked to) — the entry is saved already
+    reviewed. Leave notes unset to just capture it for later triage via get_unreviewed().
+
+    Safe to call again on the same URL — it won't create a duplicate."""
+    from app.pipeline.fetch import _resolve_external_link, MIN_CATEGORIZE_WORDS, MIN_SUMMARIZE_WORDS
+    from app.pipeline.categorize import (
+        categorize_bookmarks,
+        NOT_ENOUGH_CONTENT_CATEGORY,
+        NOT_ENOUGH_CONTENT_TAG,
+        NOT_ENOUGH_CONTENT_SUMMARY,
+    )
+    from app.db import get_categories, get_all_tags, insert_bookmarks
+
+    normalized_url = url if url.startswith("http") else f"https://{url}"
+    source_id = "article_" + hashlib.sha256(normalized_url.encode()).hexdigest()[:16]
+    db_path = _db()
+
+    with sqlite3.connect(db_path) as conn:
+        existing = conn.execute("SELECT 1 FROM bookmarks WHERE tweet_id = ?", (source_id,)).fetchone()
+    if existing:
+        return {"status": "already_exists", "tweet_id": source_id, "tweet_url": normalized_url}
+
+    try:
+        resolved_text = _resolve_external_link(normalized_url)
+    except Exception as e:
+        return {"error": f"Failed to fetch/resolve {url}: {type(e).__name__}: {e}"}
+
+    if not resolved_text:
+        return {"error": f"Could not extract any content from {url}"}
+
+    word_count = len(resolved_text.split())
+    domain = urlparse(normalized_url).netloc.removeprefix("www.") or None
+
+    bookmark = {
+        "tweet_id": source_id,
+        "author_username": domain,
+        "author_name": None,
+        "post_text": None,
+        "quoted_from_tweet_id": None,
+        "media_urls": None,
+        "tweet_url": normalized_url,
+        "bookmarked_at": None,
+        "source_type": "article",
+        "reviewed": 1 if notes else 0,
+        "review_notes": notes,
+    }
+
+    if word_count >= MIN_SUMMARIZE_WORDS:
+        content_for_summary, force_summary_sentinel = resolved_text, False
+    elif word_count >= MIN_CATEGORIZE_WORDS:
+        bookmark["post_text"] = resolved_text
+        content_for_summary, force_summary_sentinel = resolved_text, True
+    else:
+        bookmark["post_text"] = resolved_text
+        content_for_summary, force_summary_sentinel = None, False
+
+    if content_for_summary is None:
+        bookmark["category"] = NOT_ENOUGH_CONTENT_CATEGORY
+        bookmark["summary"] = NOT_ENOUGH_CONTENT_SUMMARY
+        bookmark["tags"] = json.dumps([NOT_ENOUGH_CONTENT_TAG])
+    else:
+        bookmark["content_for_summary"] = content_for_summary
+        if force_summary_sentinel:
+            bookmark["_force_summary_sentinel"] = True
+        categorized = categorize_bookmarks(
+            [bookmark], existing_categories=get_categories(db_path), known_tags=get_all_tags(db_path)
+        )
+        if not categorized:
+            return {"error": "Categorization failed (malformed LLM response) — nothing was saved"}
+        bookmark = categorized[0]
+
+    count = insert_bookmarks([bookmark], db_path)
+    if count == 0:
+        return {"status": "already_exists", "tweet_id": source_id, "tweet_url": normalized_url}
+
+    return {
+        "status": "added",
+        "tweet_id": source_id,
+        "tweet_url": normalized_url,
+        "category": bookmark["category"],
+        "tags": json.loads(bookmark["tags"]),
+        "summary": bookmark["summary"],
+        "reviewed": bool(bookmark["reviewed"]),
+    }
+
+
+@mcp.tool()
+def mark_reviewed(tweet_id: str, notes: str = None) -> dict:
+    """Mark a ResearchScout entry as reviewed — call this after discussing/triaging it (e.g. in a
+    Research Observatory session) to record the conclusion: promoted to decisionos-context (and
+    why), rejected as not relevant (and why), or deferred. Pass the user's own notes, or write
+    them on the user's behalf if asked to. If the entry already has notes from an earlier review,
+    the new notes are appended rather than overwriting them."""
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT review_notes FROM bookmarks WHERE tweet_id = ?", (tweet_id,)).fetchone()
+        if row is None:
+            return {"error": f"No bookmark found with tweet_id {tweet_id}"}
+
+        existing_notes = row["review_notes"]
+        if notes and existing_notes:
+            final_notes = f"{existing_notes}\n\n---\n{notes}"
+        else:
+            final_notes = notes or existing_notes
+
+        conn.execute(
+            "UPDATE bookmarks SET reviewed = 1, review_notes = ? WHERE tweet_id = ?",
+            (final_notes, tweet_id),
+        )
+        conn.commit()
+    return {"updated": tweet_id, "reviewed": True, "review_notes": final_notes}
+
+
+@mcp.tool()
+def get_unreviewed(limit: int = 50) -> list[dict]:
+    """Get entries not yet reviewed — the starting point for a Research Observatory triage
+    session: what's new since the last pass, across both X posts and manually-added sources.
+    Ordered most recently added first."""
+    with sqlite3.connect(_db()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""SELECT {BOOKMARK_FIELDS} FROM bookmarks WHERE reviewed = 0
+               ORDER BY bookmarked_at DESC, categorized_at DESC LIMIT ?""",
+            (min(limit, 200),),
+        ).fetchall()
+    return [_row_with_parsed_tags(row) for row in rows]

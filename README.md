@@ -1,6 +1,6 @@
-# X Bookmarks Analysis
+# ResearchScout
 
-I built this to automatically fetch, categorize, and search my X bookmarks using AI. Every bookmark gets a category, one or more topic tags, and a ~128 word summary written by LLM of your choice. Article-only "teaser" posts get their full body scraped, quote-tweets get the quoted content merged in, images get described in text, and bare PDF links get resolved to a real abstract (or a plain note if it isn't a paper). I can search, filter, and manage everything conversationally from any device.
+I built this to automatically fetch, categorize, and search my X bookmarks using AI — it's since grown into a general research-capture tool: any article, paper, or link can be added the same way, not just X posts. Every entry gets a category, one or more topic tags, and a summary written by LLM of your choice. Article-only X "teaser" posts get their full body scraped, quote-tweets become their own linked entries, and bare PDF links get resolved to a real abstract (or a plain note if it isn't a paper). I can search, filter, and manage everything conversationally from any device.
 
 ---
 
@@ -159,12 +159,14 @@ curl -X POST https://{YOUR_RAILWAY_URL}/sync/upload-db \
 This gives you a live connection to your bookmark database from any device — no file uploads needed. Claude can search, filter, and edit your bookmarks in any conversation.
 
 1. [claude.ai](https://claude.ai) → **Settings** → **Connectors** → **Add custom connector**
-2. **Name**: `X Bookmarks`
+2. **Name**: `ResearchScout`
 3. **Remote MCP server URL**: `https://{YOUR_RAILWAY_URL}/mcp/sse`
 
 You can then ask Claude things like:
 - *"What are my most bookmarked topics?"*
 - *"Search my bookmarks for MCP servers"*
+- *"Add this article to ResearchScout: https://..."*
+- *"What haven't I reviewed yet?"*
 - *"Rename category 'External Links' to 'Unread Articles'"*
 - *"Merge 'Link Shares' and 'Link-Only Posts' into 'Bare Links'"*
 - *"Move these bookmarks to a new category called 'AI Infrastructure'"*
@@ -172,11 +174,15 @@ You can then ask Claude things like:
 - *"Pull up my Uncategorized bookmarks and suggest a tag for each"*
 - *"What has karpathy posted that I've bookmarked?"*
 
-**Available tools:** `get_bookmark_stats`, `get_categories`, `get_bookmarks_by_category`, `search_bookmarks`, `get_recent_bookmarks`, `get_sync_status`, `trigger_sync`, `rename_category`, `move_bookmarks`, `merge_categories`, `delete_bookmarks`, `delete_category`, `edit_bookmark`, `get_bookmark_by_tweet_id`, `get_bookmarks_by_author`, `get_authors`, `get_bookmarks_by_content_source`, `get_bookmarks_by_image_processing_status`, `get_bookmarks_by_tag`, `add_tag_to_bookmark`
+**Available tools:** `get_bookmark_stats`, `get_categories`, `get_bookmarks_by_category`, `search_bookmarks`, `get_recent_bookmarks`, `get_sync_status`, `trigger_sync`, `rename_category`, `move_bookmarks`, `merge_categories`, `delete_bookmarks`, `delete_category`, `edit_bookmark`, `get_bookmark_by_tweet_id`, `get_bookmarks_by_author`, `get_authors`, `get_bookmarks_by_tag`, `add_tag_to_bookmark`, `get_full_content`, `add_source`, `mark_reviewed`, `get_unreviewed`
 
 ### Tags
 
 Each bookmark can carry several tags at once (e.g. a post can be both "Open Source AI" and "Cloud Hosting & Inference Costs"), pulled from a fixed, curated vocabulary rather than invented per-post — that vocabulary only grows deliberately, when you approve a new one. Anything that doesn't fit an existing tag gets `"Uncategorized"` instead of forcing a bad fit; ask any connected AI to pull those up (`get_bookmarks_by_tag(["Uncategorized"])`) and suggest tags for you to approve.
+
+### Adding non-X sources
+
+Share a link in conversation and ask the connected AI to add it — `add_source(url)` fetches, categorizes, tags, and summarizes it the same way an X post would. Pass `notes` if you've already discussed it and have a conclusion to record; otherwise it's saved for later triage. `get_unreviewed()` lists everything — X posts or added sources — not yet reviewed; `mark_reviewed(tweet_id, notes)` records the outcome of a review (notes accumulate across multiple reviews rather than overwriting).
 
 ---
 
