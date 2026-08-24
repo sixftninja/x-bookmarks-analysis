@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from app.routes import query, sync
@@ -5,13 +6,19 @@ from app.db import init_db
 from app.mcp_server import mcp
 import os
 
-app = FastAPI(title="ResearchScout API")
 
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app):
     db_path = os.getenv("DATABASE_URL", "./bookmarks.db")
     init_db(db_path)
+    # streamable_http_app()'s session manager needs its own lifespan run
+    # for the duration of the app — mounting the app alone doesn't do this;
+    # skipping it leaves the session manager never started.
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="ResearchScout API", lifespan=lifespan)
 
 
 # The MCP interface (unlike the read-only query routes) can edit, delete,
@@ -31,4 +38,9 @@ async def mcp_auth_middleware(request: Request, call_next):
 
 app.include_router(query.router)
 app.include_router(sync.router)
-app.mount("/mcp", mcp.sse_app())
+# streamable_http_app()'s own internal route is already "/mcp" (FastMCP's
+# default streamable_http_path) — mounted at root so the final path is
+# exactly /mcp, not /mcp/mcp. This replaces the older SSE transport
+# (mcp.sse_app(), which served /mcp/sse + /mcp/messages) now that both
+# Claude's and ChatGPT's connector UIs ask for Streamable HTTP specifically.
+app.mount("/", mcp.streamable_http_app())
