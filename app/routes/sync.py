@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Header, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import asyncio
 import os
+import sqlite3
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -70,6 +72,40 @@ async def upload_db(file: UploadFile = File(...), x_sync_secret: str = Header(de
     with open(db_path, "wb") as f:
         f.write(content)
     return {"status": "ok", "path": db_path, "size_bytes": len(content)}
+
+
+class TokenUpload(BaseModel):
+    access_token: str
+    refresh_token: str
+    expires_at: str
+    scope: str = ""
+
+
+# Unlike /sync/upload-db (whole-file overwrite), this touches only the
+# oauth_tokens row — needed because X's refresh tokens rotate on every use,
+# so re-authenticating locally (scripts/first_auth.py) invalidates whatever
+# refresh token Railway is holding. Re-uploading the whole db to fix that
+# would also clobber bookmarks/reviews/tags Railway has that local doesn't.
+@router.post("/sync/upload-token")
+async def upload_token(payload: TokenUpload, x_sync_secret: str = Header(default=None)):
+    expected = os.getenv("SYNC_SECRET", "")
+    if not x_sync_secret or x_sync_secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Sync-Secret header")
+    db_path = os.getenv("DATABASE_URL", "./bookmarks.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at, scope, updated_at)
+               VALUES (1, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(id) DO UPDATE SET
+                   access_token = excluded.access_token,
+                   refresh_token = excluded.refresh_token,
+                   expires_at = excluded.expires_at,
+                   scope = excluded.scope,
+                   updated_at = excluded.updated_at""",
+            (payload.access_token, payload.refresh_token, payload.expires_at, payload.scope),
+        )
+        conn.commit()
+    return {"status": "ok"}
 
 
 @router.post("/sync")
